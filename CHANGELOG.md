@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### New Features
+
+- **Sandboxes can tell the model when their workspace changed underneath the conversation.** A `Sandbox` may implement `workspaceNotice(scope)`, returning a `WorkspaceNotice`; the session calls it at the start of each response and at every turn boundary, narrates the notice as an `environment` signal, and acknowledges it once the signal is durably recorded.
+
 ## 2.3.0 - 2026-10-12
 
 ### New Features
