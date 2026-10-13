@@ -52,12 +52,16 @@ const ORPHANED_EXEC_SUFFIX =
 
 /**
  * The `Sandbox.exec` abort race, implemented once for every wrapper-built
- * adapter: when `signal` aborts mid-flight, reject promptly with an
- * `AbortError` — never gated on the provider promise, which most sandbox
- * SDKs cannot cancel. The provider promise becomes an orphan whose
- * fulfillment AND rejection are consumed here (load-bearing on workerd,
- * where an unhandled rejection is an exception) and reported only to
- * `onOrphanSettled`.
+ * adapter: when `signal` aborts mid-flight, reject with an `AbortError`
+ * without waiting on the provider promise, which most sandbox SDKs cannot
+ * cancel. The provider promise becomes an orphan whose fulfillment AND
+ * rejection are consumed here (load-bearing on workerd, where an unhandled
+ * rejection is an exception) and reported only to `onOrphanSettled`.
+ *
+ * With `cancelGraceMs`, the driver cancels the command itself when `signal`
+ * aborts, so the race first waits up to that long for the provider promise:
+ * a command that settles in time rejects with a plain `AbortError` (it is
+ * confirmed stopped); one still running is orphaned as above.
  *
  * A pre-aborted signal rejects before `run()` is invoked, so the command
  * never executes; without a signal this is a plain await of `run()`.
@@ -66,11 +70,12 @@ function raceExecAbort(
 	command: string,
 	run: () => Promise<ShellResult>,
 	signal: AbortSignal | undefined,
-	onOrphanSettled?: (settlement: OrphanedExecSettlement) => void,
+	options: SandboxFromDriverOptions = {},
 ): Promise<ShellResult> {
 	if (signal?.aborted) return Promise.reject(abortErrorFor(signal));
 	if (!signal) return run();
 
+	const { onOrphanSettled, cancelGraceMs } = options;
 	const startedAt = new Date();
 	let pending: Promise<ShellResult>;
 	try {
@@ -82,15 +87,10 @@ function raceExecAbort(
 	return new Promise<ShellResult>((resolve, reject) => {
 		let settled = false;
 
-		const onAbort = (): void => {
-			if (settled) return;
-			settled = true;
-			const abortedAt = new Date();
-			// The provider promise is now an orphan. Consume both settlement
-			// paths so nothing can surface as an unhandled rejection, and hand
-			// the settlement to the adapter's observer — its only outlet: the
-			// conversation already recorded the terminal story at abort time,
-			// and a post-hoc second outcome would violate reducer invariants.
+		const orphan = (abortedAt: Date): void => {
+			// The conversation records the terminal story at abort time, and a
+			// post-hoc second outcome would violate reducer invariants, so the
+			// observer is the settlement's only outlet.
 			const record = (outcome: { result: ShellResult } | { error: unknown }): void => {
 				try {
 					onOrphanSettled?.({ command, startedAt, abortedAt, settledAt: new Date(), ...outcome });
@@ -113,6 +113,20 @@ function raceExecAbort(
 			}
 			reject(error);
 		};
+
+		const onAbort = (): void => {
+			if (settled) return;
+			settled = true;
+			const abortedAt = new Date();
+			if (cancelGraceMs === undefined) {
+				orphan(abortedAt);
+				return;
+			}
+			void settlesWithin(pending, cancelGraceMs).then((stopped) => {
+				if (stopped) reject(abortErrorFor(signal));
+				else orphan(abortedAt);
+			});
+		};
 		signal.addEventListener('abort', onAbort, { once: true });
 
 		pending.then(
@@ -133,6 +147,19 @@ function raceExecAbort(
 			},
 		);
 	});
+}
+
+/** Whether `promise` settles (either way) within `ms`. */
+function settlesWithin(promise: Promise<unknown>, ms: number): Promise<boolean> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const expired = new Promise<false>((resolve) => {
+		timer = setTimeout(() => resolve(false), ms);
+	});
+	const settled = promise.then(
+		() => true,
+		() => true,
+	);
+	return Promise.race([settled, expired]).finally(() => clearTimeout(timer));
 }
 
 /**
@@ -327,9 +354,10 @@ function assertBashLike(value: unknown): asserts value is BashLike {
  *     should ignore it; the deadline is still enforced via `timeoutMs`, and
  *     the {@link sandboxFromDriver} wrapper owns caller-facing abort:
  *     on abort it rejects promptly and treats the still-running command as an
- *     orphan ({@link OrphanedExecSettlement}). Adapters must not implement
- *     their own abort race — a second one is redundant and splits the orphan
- *     bookkeeping.
+ *     orphan ({@link OrphanedExecSettlement}). A driver that kills the
+ *     command on abort passes `cancelGraceMs` so the wrapper waits for that
+ *     kill to land. Adapters must not implement their own abort race — a
+ *     second one is redundant and splits the orphan bookkeeping.
  *
  * Sandbox adapters that support both should observe whichever fires first.
  *
@@ -370,21 +398,33 @@ export interface SandboxDriver {
 /** @deprecated Renamed to {@link SandboxDriver}. */
 export type SandboxApi = SandboxDriver;
 
+export interface SandboxFromDriverOptions {
+	/**
+	 * Observes {@link OrphanedExecSettlement}s: the eventual settlement of
+	 * commands whose caller was released early by an abort. Adapter-facing
+	 * only — the runtime never records orphan settlements.
+	 */
+	onOrphanSettled?: (settlement: OrphanedExecSettlement) => void;
+	/**
+	 * Declares that the driver's `exec` cancels the command when its
+	 * `signal` aborts (for example by killing its process group). On abort
+	 * the wrapper waits up to this long for `exec` to settle, so a caller
+	 * released with a plain `AbortError` knows the command stopped; a
+	 * command still running after the grace period is orphaned.
+	 */
+	cancelGraceMs?: number;
+}
+
 /**
  * Wrap a SandboxDriver into a live Sandbox. No just-bash, no intermediate
  * filesystem layer.
- *
- * `options.onOrphanSettled` observes {@link OrphanedExecSettlement}s: the
- * eventual settlement of commands whose caller was released early by an
- * abort. Adapter-facing only — the runtime never records orphan settlements.
  */
 export function sandboxFromDriver(
 	driver: SandboxDriver,
 	cwd: string,
-	options?: { onOrphanSettled?: (settlement: OrphanedExecSettlement) => void },
+	options: SandboxFromDriverOptions = {},
 ): Sandbox {
 	const resolvePath = makeResolvePath(cwd);
-	const onOrphanSettled = options?.onOrphanSettled;
 
 	return {
 		async exec(
@@ -414,7 +454,7 @@ export function sandboxFromDriver(
 						signal,
 					}),
 				signal,
-				onOrphanSettled,
+				options,
 			);
 		},
 

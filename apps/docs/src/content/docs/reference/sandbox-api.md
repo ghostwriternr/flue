@@ -175,7 +175,10 @@ An adapter may return a sandbox with additional properties — a native surface 
 function sandboxFromDriver(
   driver: SandboxDriver,
   cwd: string,
-  options?: { onOrphanSettled?: (settlement: OrphanedExecSettlement) => void },
+  options?: {
+    onOrphanSettled?: (settlement: OrphanedExecSettlement) => void;
+    cancelGraceMs?: number;
+  },
 ): Sandbox;
 ```
 
@@ -184,10 +187,11 @@ Wraps a `SandboxDriver` — the minimal interface a remote provider adapter impl
 - Path resolution: relative file paths and relative/absent `exec` working directories resolve against `cwd`, POSIX-normalized. The `driver` methods always receive absolute paths.
 - The `writeFile` parent-creation guarantee: a failed write is retried once after `driver.mkdir(parent, { recursive: true })`; when the retry still fails, the retried write's error propagates.
 - The `exec` abort race: an already-aborted signal rejects with `AbortError` before `driver.exec` is called. An abort that fires mid-flight rejects promptly too — the wrapper never waits on `driver.exec`'s own settlement to decide the caller's outcome, whether or not the adapter wired `signal` into its SDK. The adapter only needs to forward `signal` when its SDK has a real cancellation primitive; the abort race and the promise-consumption below apply either way.
+- Confirmed cancellation, with `options.cancelGraceMs`: an adapter whose `driver.exec` stops the command when `signal` aborts (for example by killing its process group) sets this to how long that takes. On abort, the wrapper waits up to that long for `driver.exec` to settle and then rejects with a plain `AbortError`, so the next call never races the stopped command. A command still running after the grace period is orphaned as below.
 
 ### Orphaned commands
 
-When an abort fires before `driver.exec`'s promise has settled, that promise becomes an **orphaned command**: the caller has already been released with an `AbortError`, but the provider call keeps running until it settles on its own. A cancel-capable adapter that forwards `signal` still produces one of these — the window just shrinks from the command's remaining duration down to the SDK's cancellation latency, since the wrapper's rejection always races ahead of that confirmation.
+When an abort fires before `driver.exec`'s promise has settled, that promise becomes an **orphaned command**: the caller has already been released with an `AbortError`, but the provider call keeps running until it settles on its own. A cancel-capable adapter that forwards `signal` without `cancelGraceMs` still produces one of these — the window just shrinks from the command's remaining duration down to the SDK's cancellation latency, since the wrapper's rejection races ahead of that confirmation. With `cancelGraceMs`, only a command that outlives the grace period becomes an orphan, and its `AbortError` message says it may still be running.
 
 An orphan's eventual settlement — fulfillment or rejection — is never appended to the conversation; the abort already stands as the command's terminal result, and a second outcome arriving later would violate reducer invariants. It's consumed here so it can't surface as an unhandled rejection, and reported only through `options.onOrphanSettled`:
 

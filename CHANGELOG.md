@@ -5,6 +5,7 @@
 ### New Features
 
 - **Sandboxes can tell the model when their workspace changed underneath the conversation.** A `Sandbox` may implement `workspaceNotice(scope)`, returning a `WorkspaceNotice`; the session calls it at the start of each response and at every turn boundary, narrates the notice as an `environment` signal, and acknowledges it once the signal is durably recorded.
+- **`sandboxFromDriver()` accepts `cancelGraceMs` for drivers that stop a command when its `signal` aborts.** On abort, the wrapper waits up to that long for `driver.exec` to settle and then rejects with a plain `AbortError`, so the next call never races the stopped command; a command still running after the grace period is orphaned as before. The `SandboxFromDriverOptions` type is exported.
 
 ## 2.3.0 - 2026-10-12
 
