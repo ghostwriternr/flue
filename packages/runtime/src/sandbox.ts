@@ -198,7 +198,7 @@ function posixParentDir(p: string): string {
 }
 
 /** Collapse `.`/`..`/empty segments of a POSIX path into a normalized absolute path. */
-function normalizePath(p: string): string {
+export function normalizePath(p: string): string {
 	const parts = p.split('/');
 	const result: string[] = [];
 	for (const part of parts) {
@@ -364,11 +364,10 @@ function assertBashLike(value: unknown): asserts value is BashLike {
  * Liveness: an adapter should ensure in-flight operations settle when the
  * sandbox dies, by whatever mechanism its provider SDK supports — native
  * rejection of in-flight calls, or polling a cheap control-plane status read
- * while a call is pending (the first-party Cloudflare adapter does the latter
- * internally). An adapter with no such mechanism carries an accepted
- * limitation: when the provider transport never settles a call after the
- * sandbox dies, that call may hang until the surrounding operation is
- * aborted. There is deliberately no per-command deadline in this contract —
+ * while a call is pending. An adapter with no such mechanism carries an
+ * accepted limitation: when the provider transport never settles a call
+ * after the sandbox dies, that call may hang until the surrounding operation
+ * is aborted. There is deliberately no per-command deadline in this contract —
  * agent commands are legitimately unbounded, and `timeoutMs` is the command's
  * own deadline, not an infrastructure liveness bound. An adapter that detects
  * sandbox death should reject with `SandboxDiedError` (exported from

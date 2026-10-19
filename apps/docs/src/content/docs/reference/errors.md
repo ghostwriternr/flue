@@ -227,6 +227,14 @@ Thrown by `prompt()`, `skill()`, and `task()` when the call set `options.result`
 - `reason` — the model-supplied explanation.
 - `assistantText` — the assistant transcript accumulated before the give-up.
 
+## `SandboxDiedError`
+
+```ts
+class SandboxDiedError extends FlueError // type: 'sandbox_died'
+```
+
+A sandbox call was in flight when the sandbox died, so it can never complete. `meta` carries `operation` and `reason`: `'stopped'` (the sandbox stopped: a crash, eviction, running out of memory, or a destroy), or `'probe_silent'` (the adapter's liveness probe went unanswered). It is not an `AbortError`: shell classification reports an infrastructure failure, not caller cancellation. See the [Sandbox API Reference](/docs/reference/sandbox-api/#sandboxdriver).
+
 ## `SandboxOperationUnsupportedError`
 
 ```ts
