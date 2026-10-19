@@ -18,6 +18,8 @@
 export { runWithCloudflareContext } from './context.ts';
 export type { CreateFlueAgentClassOptions } from './flue-agent-class.ts';
 export { createFlueAgentClass } from './flue-agent-class.ts';
+export type { CreateFlueSandboxClassOptions } from './flue-sandbox-class.ts';
+export { createFlueSandboxClass } from './flue-sandbox-class.ts';
 export { installDefaultCloudflareTracing } from './tracing/index.ts';
 export type {
 	CloudflareAgentIdentity,
