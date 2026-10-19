@@ -228,6 +228,7 @@ export function flue(config: FlueConfig = {}): Plugin[] {
 			}));
 		},
 		customizerInvoked: false,
+		flueSandbox: false,
 	};
 	registerFlueWorkerConfigSource(workerConfigSource);
 
@@ -309,6 +310,7 @@ export function flue(config: FlueConfig = {}): Plugin[] {
 			workerConfigSource.configReady = false;
 			workerConfigSource.isPreview = state.isPreview;
 			workerConfigSource.customizerInvoked = false;
+			workerConfigSource.flueSandbox = false;
 
 			const ambiguityWarning = flueConfigAmbiguityWarning(loaded.configPath);
 			if (ambiguityWarning) state.pendingWarnings.push(ambiguityWarning);
@@ -554,6 +556,7 @@ export function flue(config: FlueConfig = {}): Plugin[] {
 					agents: state.agents,
 					providers: state.project.providers,
 					tracing: state.project.tracing,
+					flueSandbox: workerConfigSource.flueSandbox,
 				});
 			}
 			return undefined;
