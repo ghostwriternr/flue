@@ -1,100 +1,165 @@
 ---
 title: Cloudflare Sandbox
 description: Run Flue agent work inside Cloudflare container-backed sandboxes.
-lastReviewedAt: 2026-09-16
+lastReviewedAt: 2026-10-13
 ---
 
 import CopyPrompt from '../../../../components/docs/CopyPrompt.astro';
 
-Cloudflare Sandbox uses `@cloudflare/sandbox` to provide a container-backed Linux environment to a Flue application deployed on Cloudflare. This integration is platform-native: it is not an adapter module for a Node-target application.
+The Cloudflare sandbox gives a Flue application deployed on Cloudflare a container-backed Linux environment, on [Containers](https://developers.cloudflare.com/containers/). Flue ships `FlueSandbox`, the Durable Object that runs each sandbox's container. The integration is platform-native: it is not an adapter module for a Node-target application, and it needs no extra package.
 
 ## Quickstart
 
-Add container-backed Linux sandbox capability to an existing Flue project with the [Cloudflare Sandbox](https://developers.cloudflare.com/sandbox) blueprint.
+Add container-backed Linux sandbox capability to an existing Flue project with the Cloudflare Sandbox blueprint.
 
 <CopyPrompt text="Run `flue add sandbox cloudflare` and follow the blueprint to add a Cloudflare Sandbox to this Flue project." />
 
 Copy this prompt into your coding agent. The blueprint the agent fetches is an implementation guide, not an installer — the agent reads it, then inspects and modifies your project. It may:
 
-- Install `@cloudflare/sandbox`.
-- Add or update `cloudflare.ts` in the Flue source root.
-- Add the Sandbox Durable Object binding and a new migration entry to `wrangler.jsonc`.
+- Upgrade `@cloudflare/vite-plugin` and `wrangler`.
+- Add the `FlueSandbox` container entry and a new migration entry to `wrangler.jsonc`.
 - Create or update the container `Dockerfile`.
-- Modify your Flue agent to obtain the sandbox with `getSandbox(...)` and attach it with `useSandbox(...)`.
+- Define the sandbox in `cloudflare.ts` and attach it in your Flue agent with `useSandbox(...)`.
 - Inspect the existing project structure and avoid overwriting incompatible setup.
 
-If your project currently targets Node, the blueprint will stop and confirm with you before migrating the whole project to the Cloudflare target — Cloudflare Sandbox only runs inside a Worker.
+If your project currently targets Node, the blueprint will stop and confirm with you before migrating the whole project to the Cloudflare target — the Cloudflare sandbox only runs inside a Worker.
 
 Before you start, check two prerequisites:
 
-- **Workers Paid plan.** Cloudflare Sandbox runs on [Containers](https://developers.cloudflare.com/containers/), which is a Workers Paid feature. See [Sandbox pricing](https://developers.cloudflare.com/sandbox/platform/pricing/).
-- **Docker for local development.** `vite dev` builds and runs the sandbox container image locally, so the Docker daemon must be installed and running. Deployed Workers do not need Docker.
+- **Workers Paid plan.** Containers are a Workers Paid feature. See [Containers pricing](https://developers.cloudflare.com/containers/pricing/).
+- **Docker for local development.** `vite dev` builds and runs the container image locally, so the Docker daemon must be installed and running. Deployed Workers do not need Docker.
 
 ## Overview
 
-Cloudflare Sandbox is a Cloudflare target integration rather than a generated adapter. In a Cloudflare-targeted project, the blueprint installs `@cloudflare/sandbox`; the agent function obtains the bound Durable Object with `getSandbox(...)`, wraps it with Flue's `cloudflareSandbox(...)`, and attaches it with `useSandbox(...)`.
+A sandbox definition says how a kind of sandbox runs. Export it from `cloudflare.ts`, then use it in agents:
 
-```ts title="src/agents/coding-agent.ts (excerpt)"
-'use agent';
-import { env } from 'cloudflare:workers';
-import { type AgentProps, useModel, useSandbox } from '@flue/runtime';
+```ts title="src/cloudflare.ts"
 import { cloudflareSandbox } from '@flue/runtime/cloudflare';
-import { getSandbox } from '@cloudflare/sandbox';
 
-interface Env {
-	Sandbox: DurableObjectNamespace;
-}
+export const workspace = cloudflareSandbox();
+```
 
-export function CodingAgent({ id }: AgentProps) {
+```ts title="src/agents/coding-agent.ts"
+'use agent';
+import { useModel, useSandbox } from '@flue/runtime';
+import { workspace } from '../cloudflare.ts';
+
+export function CodingAgent() {
 	useModel('anthropic/claude-opus-4-7');
-	const { Sandbox } = env as unknown as Env;
-	useSandbox(cloudflareSandbox(getSandbox(Sandbox, id)));
+	useSandbox(workspace);
+	return 'You have a full Linux sandbox. Use it to complete whatever the user asks.';
 }
 ```
 
-The blueprint also exports `Sandbox` from the source-root `cloudflare.ts`, adds its Durable Object binding, a new migration entry, and its container declaration to `wrangler.jsonc`, and creates a project-root `Dockerfile` whose image tag matches the installed package version. Agent shell and file operations run in the container-backed sandbox keyed by the agent instance id. Cloudflare's direct delete API does not expose recursive or force controls, so `cloudflareSandbox()` implements either option by running `rm` in the container, matching Node's `fs.rm` semantics. A Node-targeted project must migrate to the Cloudflare target before using this integration.
+Each sandbox is one container and one workspace, run by one `FlueSandbox` Durable Object, and is identified by its definition's export name and a **sandbox id**. The id defaults to the agent instance id, so each agent instance gets its own sandbox. Agent shell and file operations all run as commands in the container.
+
+Containers have no control plane of their own, so `FlueSandbox` plays that role:
+
+- **Start.** The first call after a stop starts the container from the sandbox's image.
+- **Idle stop.** After `idleTimeoutMs` (10 minutes by default) with no call from any attached agent and no running command, Flue stops the container, which discards its workspace. A running command keeps the container alive, even after the agent that started it has gone.
+- **Unexpected loss.** When a container stops without Flue stopping it (a crash, running out of memory, eviction), the next call starts a fresh container from the image.
+- **Cancellation.** Aborting a command kills its whole process group in the container. A `timeoutMs` deadline runs inside the container, so it holds even if a Durable Object restarts.
 
 ## Configure
 
-| Requirement                                  | Purpose                                                                                                                      |
-| -------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| Cloudflare target                            | **Required** — Runs the platform-native sandbox integration.                                                                 |
-| Workers Paid plan                            | **Required** — Containers, which back the sandbox, are a Workers Paid feature.                                               |
-| Docker (local development only)              | **Required for `vite dev`** — Builds and runs the container image locally; not needed for deployed Workers.                  |
-| `@cloudflare/sandbox` package                | **Required** — Provides the Sandbox Durable Object and RPC client.                                                           |
-| Container image                              | **Required** — Defines the Linux filesystem and command environment.                                                         |
-| Durable Object/container binding             | **Required on Cloudflare** — Exposes the sandbox through Wrangler platform configuration; it is not an environment variable. |
-| Stable sandbox identity and retention policy | **Required** — Controls lifecycle and reuse for the application.                                                             |
-| Environment-variable credentials             | **Not required** — The platform integration uses Cloudflare bindings and deployment configuration instead.                   |
+| Requirement                     | Purpose                                                                                                          |
+| ------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| Cloudflare target               | **Required** — Runs the platform-native sandbox integration.                                                     |
+| Workers Paid plan               | **Required** — Containers are a Workers Paid feature.                                                            |
+| Docker (local development only) | **Required for `vite dev`** — Builds and runs the container image locally; not needed for deployed Workers.      |
+| `FlueSandbox` container         | **Required** — The `containers` entry and migration in `wrangler.jsonc`.                                         |
+| Container image                 | **Recommended** — Defines the Linux filesystem and tools; without one, sandboxes use `cloudflare/debian-trixie`. |
+| `@cloudflare/vite-plugin` 1.63+ | **Required** — Supports the `durable_object` scheduling policy. Needs `wrangler` 4.150 or later.                 |
 
-Cloudflare Sandbox requires a Worker deployment, Durable Object/container configuration, and a container image. Add the dependency to a Cloudflare-targeted project and export its Durable Object class from your Cloudflare deployment module:
+Declare the `FlueSandbox` container entry and append a migration in `wrangler.jsonc`:
 
-```ts
-// <source-root>/cloudflare.ts
-export { Sandbox } from '@cloudflare/sandbox';
-```
-
-Declare the sandbox binding in Wrangler configuration, then wrap the RPC stub returned by `getSandbox(...)` with `cloudflareSandbox(...)` and pass it to an agent:
-
-```ts
-import { env } from 'cloudflare:workers';
-import { getSandbox } from '@cloudflare/sandbox';
-import { type AgentProps, useModel, useSandbox } from '@flue/runtime';
-import { cloudflareSandbox } from '@flue/runtime/cloudflare';
-
-interface Env {
-	Sandbox: DurableObjectNamespace;
-}
-
-export function Assistant({ id }: AgentProps) {
-	useModel('anthropic/claude-sonnet-4-6');
-	const { Sandbox } = env as unknown as Env;
-	useSandbox(cloudflareSandbox(getSandbox(Sandbox, id)), { cwd: '/workspace' });
+```jsonc title="wrangler.jsonc (excerpt)"
+{
+	"migrations": [
+		// ...existing entries, unchanged...
+		{ "tag": "flue-sandbox", "new_sqlite_classes": ["FlueSandbox"] },
+	],
+	"containers": [
+		{
+			"class_name": "FlueSandbox",
+			"name": "my-app-sandbox",
+			"scheduling_policy": "durable_object",
+			"images": { "default": { "dockerfile": "./Dockerfile" } },
+		},
+	],
 }
 ```
+
+`flueWorkerConfig()` adds the `FlueSandbox` Durable Object binding and rejects an entry that lacks `"scheduling_policy": "durable_object"` or sets `image`, `instance_type`, or `max_instances` (each definition chooses its instance type). The generated Worker exports `FlueSandbox`.
+
+The image must provide `bash`, coreutils, findutils, util-linux `setsid`, and a long-lived main process. Use `tini` as the entrypoint so killed processes are reaped:
+
+```dockerfile title="Dockerfile"
+FROM node:24-trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      bash ca-certificates git ripgrep tini procps \
+    && rm -rf /var/lib/apt/lists/*
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["sleep", "infinity"]
+```
+
+Image `ENV` lines do not reach agent commands. Commands start from a fixed baseline (`HOME`, `LANG`, `TERM`, and a Debian `PATH`); pass the rest when [attaching](#attach).
+
+## Settings
+
+```ts title="src/cloudflare.ts"
+export const workspace = cloudflareSandbox({
+	image: 'default', // key in the container entry's images map
+	instance: 'standard-1',
+	enableInternet: true,
+	idleTimeoutMs: 10 * 60_000,
+});
+```
+
+Settings are code: Flue reads them from the definition on every container start, so a deploy that changes them reaches existing sandboxes. The idle timeout applies as soon as the deploy is live, and `image`, `instance`, and `enableInternet` at the next start.
+
+Pass a function to vary settings per sandbox. It receives the sandbox `id` and the Worker `env`, and runs on every start:
+
+```ts
+export const workspace = cloudflareSandbox(({ id }) => ({
+	instance: id.startsWith('build:') ? 'standard-4' : 'standard-1',
+}));
+```
+
+`instance` defaults to `standard-1`. The platform's smaller `lite` instance has 1/16 of a vCPU and 256 MiB of memory: each command takes most of a second, and installing packages takes minutes. See the [Sandbox API reference](/docs/reference/sandbox-api/#cloudflaresandboxsettings) for every setting.
+
+### Definitions and identity
+
+The export name is part of each sandbox's identity: renaming `workspace` starts new, empty sandboxes. To rename a definition in code, keep exporting it under the old name too (`export { builder as workspace }`). A definition must be exported from `cloudflare.ts` before an agent can use it; define as many as you need, one per kind of sandbox.
+
+## Attach
+
+`useSandbox(workspace)` gives each agent instance its own sandbox. `attach()` sets how one agent attaches:
+
+```ts
+useSandbox(
+	workspace.attach({ id: 'repo-42', cwd: '/workspace/app', env: { NODE_ENV: 'development' } }),
+);
+```
+
+- `id` — the sandbox id; default: the agent instance id.
+- `cwd` — the working directory, created on every start; default: `/workspace`.
+- `env` — environment for this agent's commands, layered over the baseline. Not for secrets: every process in the container can read them.
+
+## Shared sandboxes
+
+Agents that attach to the same definition with the same `id` share one sandbox: one container, one workspace, and one network identity. Use separate `cwd` values to keep their files apart.
+
+```ts
+useSandbox(workspace.attach({ id: `project:${projectId}`, cwd: '/workspace/reviewer' }));
+```
+
+## Upgrading from `@cloudflare/sandbox` 0.x
+
+The 0.x form, `cloudflareSandbox(getSandbox(env.Sandbox, id))`, still works through Flue 2.x with a deprecation warning and is removed in 3.0. To upgrade, run `flue update sandbox cloudflare` and follow the blueprint's version 2 upgrade guide. In short: replace the `Sandbox` binding and container entry with the `FlueSandbox` entry, add one migration that deletes `Sandbox` and adds `FlueSandbox`, give the container a new `name`, switch the Dockerfile off `cloudflare/sandbox`, export a `cloudflareSandbox()` definition from `cloudflare.ts`, and pass it to `useSandbox()`. Deploy the migration at 100%, then delete the old container application. Workspaces in 0.x containers do not carry over.
 
 ## Choose this integration when
 
-Use Cloudflare Sandbox when an agent on Cloudflare needs git, package installation, native binaries, or other Linux tooling. Prefer Cloudflare Shell instead when a durable workspace with Workspace-oriented operations is sufficient and a Linux toolchain is unnecessary.
+Use the Cloudflare sandbox when an agent on Cloudflare needs git, package installation, native binaries, or other Linux tooling. Prefer [Cloudflare Computer](/docs/ecosystem/sandboxes/cloudflare-computer/) when a durable workspace and shell-expressible work are enough and a Linux toolchain is unnecessary.
 
 Treat network egress, mounted data, credentials, and side effects as application security decisions. See [Sandboxes](/docs/guide/sandboxes/#remote-sandboxes) and [Deploy on Cloudflare](/docs/ecosystem/deploy/cloudflare/).

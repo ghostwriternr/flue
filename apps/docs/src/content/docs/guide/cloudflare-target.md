@@ -4,7 +4,7 @@ description: Understand the Cloudflare-specific runtime behavior and APIs for Fl
 lastReviewedAt: 2026-07-21
 ---
 
-The Cloudflare target builds your agents for the Cloudflare platform. Each agent runs inside its own Durable Object class, using the Agents SDK, Workers AI, Cloudflare Sandbox, Cloudflare Shell, and other Worker primitives where appropriate. Durable Objects give each agent conversation its own persistent state, durable execution, and global addressability out of the box.
+The Cloudflare target builds your agents for the Cloudflare platform. Each agent runs inside its own Durable Object class, using the Agents SDK, Workers AI, Containers, Cloudflare Shell, and other Worker primitives where appropriate. Durable Objects give each agent conversation its own persistent state, durable execution, and global addressability out of the box.
 
 The build is owned by Vite: `flue()` plus the official `@cloudflare/vite-plugin` in `vite.config.ts`, with `flue()` first. See [Deploy](/docs/guide/deploy/#deploy-on-cloudflare) for the plugin mechanics and [Deploy Agents on Cloudflare](/docs/ecosystem/deploy/cloudflare/) for a deployment walkthrough.
 
@@ -172,22 +172,26 @@ To customize the gateway, disable it, or target a named gateway, re-register the
 
 ## Cloudflare Sandbox
 
-[Cloudflare Sandbox](https://developers.cloudflare.com/containers/) provides container-backed Linux environments for agents that need tools such as git, package installation, native binaries, or a real filesystem. Export the sandbox Durable Object class from `cloudflare.ts`, declare its binding and container image in `wrangler.jsonc`, then wrap the RPC stub returned by `getSandbox(...)` with `cloudflareSandbox(...)`:
+The Cloudflare sandbox provides container-backed Linux environments, on [Containers](https://developers.cloudflare.com/containers/), for agents that need tools such as git, package installation, native binaries, or a real filesystem. Flue ships `FlueSandbox`, the Durable Object that runs each sandbox's container. Declare its container entry and migration in `wrangler.jsonc`, export a sandbox definition from `cloudflare.ts`, and use it in agents:
 
-```ts
-'use agent';
-import { getSandbox } from '@cloudflare/sandbox';
-import { env } from 'cloudflare:workers';
-import { type AgentProps, useModel, useSandbox } from '@flue/runtime';
+```ts title="src/cloudflare.ts"
 import { cloudflareSandbox } from '@flue/runtime/cloudflare';
 
-export function Assistant({ id }: AgentProps) {
+export const workspace = cloudflareSandbox();
+```
+
+```ts title="src/agents/assistant.ts"
+'use agent';
+import { useModel, useSandbox } from '@flue/runtime';
+import { workspace } from '../cloudflare.ts';
+
+export function Assistant() {
   useModel('anthropic/claude-sonnet-4-6');
-  useSandbox(cloudflareSandbox(getSandbox(env.Sandbox, id)), { cwd: '/workspace' });
+  useSandbox(workspace);
 }
 ```
 
-See [Cloudflare Sandbox](/docs/ecosystem/sandboxes/cloudflare/) for container configuration and lifecycle guidance.
+`flueWorkerConfig()` adds the Durable Object binding when `wrangler.jsonc` has a `containers` entry for `FlueSandbox`, and the generated Worker exports the class. See [Cloudflare Sandbox](/docs/ecosystem/sandboxes/cloudflare/) for container configuration and lifecycle guidance.
 
 ## Cloudflare Computer
 
