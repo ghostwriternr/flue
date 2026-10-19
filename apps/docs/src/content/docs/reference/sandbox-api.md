@@ -415,6 +415,7 @@ interface CloudflareSandboxSettings {
   image?: string;
   instance?: CloudflareSandboxInstance;
   enableInternet?: boolean;
+  persist?: boolean;
   idleTimeoutMs?: number;
 }
 
@@ -438,12 +439,13 @@ Cloudflare target. Defines a kind of sandbox run by `FlueSandbox`, the Durable O
 
 #### `CloudflareSandboxSettings`
 
-Flue reads settings from the definition on every container start; a function receives the sandbox `id` and the Worker `env`. A deploy that changes them reaches existing sandboxes: the idle timeout applies at once, and `image`, `instance`, and `enableInternet` at the next start. Unknown keys and invalid values throw when the definition is created, or at start for a settings function.
+Flue reads settings from the definition on every container start; a function receives the sandbox `id` and the Worker `env`. A deploy that changes them reaches existing sandboxes: the idle timeout applies at once, `instance` and `enableInternet` at the next start, `persist` at the next idle stop, and `image` the next time the sandbox boots from its image rather than a snapshot. Unknown keys and invalid values throw when the definition is created, or at start for a settings function.
 
 - `image` — key in the container entry's `images` map, or a full image reference. Defaults to the only configured image; required when there are several. A container entry without `images` uses `cloudflare/debian-trixie`.
 - `instance` — `'standard-1'` (default) to `'standard-4'`, `'lite'`, or `{ vcpu, memoryMib, diskMb }`. On `lite` (1/16 vCPU, 256 MiB) each command takes most of a second.
 - `enableInternet` — defaults to `true`.
-- `idleTimeoutMs` — idle period before Flue stops the container, discarding its workspace. Defaults to 10 minutes. Idle means no call from any attached agent and no running command.
+- `persist` — defaults to `true`: Flue snapshots the root filesystem at each idle stop and restores it at the next start. `false` discards the workspace at each stop.
+- `idleTimeoutMs` — idle period before Flue stops the container. Defaults to 10 minutes. Idle means no call from any attached agent and no running command.
 
 #### Attaching
 
@@ -460,11 +462,13 @@ Flue reads settings from the definition on every container start; a function rec
 - `stdout` and `stderr` each keep the last 1 MiB, with a note when earlier output was dropped. `readFile` rejects files larger than about 32 MiB.
 - A container that stops mid-call rejects with [`SandboxDiedError`](/docs/reference/errors/#sandboxdiederror) (`reason: 'stopped'`). The next call starts the container again.
 
+Workspace changes: a container that stops without Flue stopping it (a crash, running out of memory, eviction) is restored from the last snapshot, or started fresh when there is none. The sandbox implements [`workspaceNotice`](#workspacenotice), so the model hears "restored to <time>" or "reset" before it relies on stale files.
+
 Image requirements: `bash`, coreutils, findutils, and util-linux `setsid`, plus a long-lived main process. Use `tini` as the entrypoint so killed processes are reaped.
 
 The 0.x form `cloudflareSandbox(getSandbox(env.Sandbox, id), { cwd })`, which wraps a `@cloudflare/sandbox` 0.x `Sandbox` Durable Object stub (`CloudflareSandboxStub`), still works through Flue 2.x with a deprecation warning and is removed in 3.0.
 
-See [Cloudflare Sandbox](/docs/ecosystem/sandboxes/cloudflare/) for configuration and shared sandboxes.
+See [Cloudflare Sandbox](/docs/ecosystem/sandboxes/cloudflare/) for configuration, persistence, and shared sandboxes.
 
 ## `SandboxOperationUnsupportedError`
 

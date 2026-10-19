@@ -207,7 +207,20 @@ async function attachSandbox(
 	const stub = sandboxStub(getCloudflareContext().env, name, id);
 	const cwd = normalizePath(requestedCwd);
 	await call('start', stub.ensure(name, id, cwd));
-	return sandboxFromDriver(rpcDriver(stub, cwd, env), cwd, { cancelGraceMs: KILL_GRACE_MS });
+	const sandbox: Sandbox = {
+		...sandboxFromDriver(rpcDriver(stub, cwd, env), cwd, { cancelGraceMs: KILL_GRACE_MS }),
+		async workspaceNotice(scope) {
+			// Ask every time: another agent sharing the sandbox, or a crash,
+			// can change the workspace without any call from this agent.
+			const notice = await stub.notice(scope);
+			if (!notice) return undefined;
+			return {
+				text: notice.text,
+				acknowledge: () => stub.acknowledgeNotice(scope, notice.generation),
+			};
+		},
+	};
+	return sandbox;
 }
 
 /** The `FlueSandbox` RPC surface as a {@link SandboxDriver}: paths arrive absolute. */
