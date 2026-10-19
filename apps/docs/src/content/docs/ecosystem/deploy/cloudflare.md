@@ -434,6 +434,39 @@ export const node = cloudflareSandbox({ image: 'node' });
 
 A persisted workspace keeps the image its snapshot was taken from until it is reset.
 
+### Secure egress with intercepts
+
+When your agent runs in a container, it may need to call external APIs — GitHub, npm registries, internal services. The traditional approach is to inject API tokens as environment variables, but that means the agent (and the LLM) has direct access to those secrets.
+
+Containers can route outgoing HTTP and HTTPS requests through a Worker instead. Secrets are added in the Worker, so the container never sees them. Export a `WorkerEntrypoint` from `src/cloudflare.ts`:
+
+```typescript title="src/cloudflare.ts"
+import { WorkerEntrypoint } from 'cloudflare:workers';
+
+export class GitHubProxy extends WorkerEntrypoint<Env> {
+  async fetch(request: Request) {
+    const headers = new Headers(request.headers);
+    headers.set('Authorization', `Bearer ${this.env.GITHUB_TOKEN}`);
+    return fetch(request, { headers });
+  }
+}
+```
+
+Then route `api.github.com` to it from the sandbox definition, in the same file. A settings function receives the sandbox `id`, `env`, and the Worker's `exports`:
+
+```typescript title="src/cloudflare.ts"
+export const workspace = cloudflareSandbox(({ id, exports }) => {
+  const github = exports.GitHubProxy({ props: { sandboxId: id } });
+  return {
+    intercepts: [{ host: 'api.github.com', https: true, target: github }],
+  };
+});
+```
+
+Flue applies intercepts on every container start. Pass per-sandbox configuration as `props` (the entrypoint's `ctx.props`), and read secrets from `env` in the entrypoint. Intercepts apply to the whole container, so agents that share a sandbox share one network identity. You can also use intercepts to log requests, block specific domains, or enforce dynamic policies.
+
+For full details, see the [outbound traffic documentation](https://developers.cloudflare.com/containers/platform-details/outbound-traffic/).
+
 ### When to use a remote sandbox
 
 A **virtual sandbox** starts in milliseconds, works from R2 or inline files, provides grep, glob, read, and a basic shell, and suits high-traffic, high-scale agents. A **remote sandbox** takes seconds to start (cached images are faster) in exchange for a full Linux environment — git, Node.js, Python, browsers — and a real persistent filesystem, which coding agents and complex dev environments need.

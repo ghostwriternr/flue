@@ -26,6 +26,16 @@ export type CloudflareSandboxInstance =
 	| 'standard-4'
 	| { vcpu: number; memoryMib: number; diskMb: number };
 
+/**
+ * One outbound intercept, applied to the container on every start: requests
+ * to `host` (HTTPS too with `https: true`), or all outbound HTTP, go to
+ * `target`. The target is usually an exported `WorkerEntrypoint` from the
+ * settings function's `exports` (`exports.GitHubProxy({ props })`), or a
+ * service binding from its `env`.
+ */
+export type CloudflareSandboxIntercept =
+	{ host: string; https?: boolean; target: Fetcher } | { all: true; target: Fetcher };
+
 /** A root-filesystem snapshot of a sandbox's workspace. */
 export interface CloudflareSandboxSnapshot {
 	/** Platform snapshot id. */
@@ -42,13 +52,15 @@ export interface CloudflareSandboxContext {
 	readonly id: string;
 	/** The Worker's `env` (typed by `wrangler types`). */
 	readonly env: Cloudflare.Env;
+	/** The Worker's exports (`ctx.exports`), for intercept targets. */
+	readonly exports: Cloudflare.Exports;
 }
 
 /**
  * How a sandbox definition's containers run. Flue reads these from code on
  * every start, so a deploy that changes them reaches existing sandboxes:
- * the idle timeout at once, the instance type and internet access at the
- * next start, `persist` at the next idle stop, and the image
+ * intercepts and the idle timeout at once, the instance type and internet
+ * access at the next start, `persist` at the next idle stop, and the image
  * the next time the sandbox boots from it (a persisted workspace keeps the
  * image its snapshot was taken from until `reset()`).
  */
@@ -63,6 +75,15 @@ export interface CloudflareSandboxSettings {
 	persist?: boolean;
 	/** Idle period before Flue stops the container. Default 10 minutes. */
 	idleTimeoutMs?: number;
+	/** Outbound intercepts applied on every container start. */
+	intercepts?: readonly CloudflareSandboxIntercept[];
+	/**
+	 * Runs on every container start, after Flue prepared the container and
+	 * applied the intercepts, before any command. Use it for setup that
+	 * intercepts cannot express, such as a background process that should
+	 * run whenever the container does. Throwing fails the start.
+	 */
+	onStart?(container: Container, sandbox: CloudflareSandboxContext): Promise<void> | void;
 }
 
 /** Settings, or a function of the sandbox that returns them. */
@@ -90,7 +111,15 @@ export function isSandboxDefinition(value: unknown): value is BrandedDefinition 
 	return typeof value === 'object' && value !== null && DEFINITION in value;
 }
 
-const SETTING_KEYS = new Set(['image', 'instance', 'enableInternet', 'persist', 'idleTimeoutMs']);
+const SETTING_KEYS = new Set([
+	'image',
+	'instance',
+	'enableInternet',
+	'persist',
+	'idleTimeoutMs',
+	'intercepts',
+	'onStart',
+]);
 
 const INSTANCE_TYPES = new Set(['lite', 'standard-1', 'standard-2', 'standard-3', 'standard-4']);
 
@@ -122,7 +151,7 @@ export function validateSettings(settings: unknown, name?: string): CloudflareSa
 		const hint = MISPLACED_KEYS[key];
 		fail(hint ? `"${key}" is not a setting; ${hint}` : `unknown setting "${key}"`);
 	}
-	const { image, instance, enableInternet, persist, idleTimeoutMs } = record;
+	const { image, instance, enableInternet, persist, idleTimeoutMs, intercepts, onStart } = record;
 	if (image !== undefined && (typeof image !== 'string' || image === '')) {
 		fail('image must be a non-empty string');
 	}
@@ -144,6 +173,17 @@ export function validateSettings(settings: unknown, name?: string): CloudflareSa
 	) {
 		fail(`idleTimeoutMs must be a whole number between 1 and ${MAX_IDLE_TIMEOUT_MS}`);
 	}
+	if (intercepts !== undefined) {
+		if (!Array.isArray(intercepts)) fail('intercepts must be an array');
+		for (const intercept of intercepts as unknown[]) {
+			if (!isIntercept(intercept)) {
+				fail(
+					'each intercept needs `host` (with optional `https`) or `all: true`, and a `target` Fetcher such as exports.MyProxy({ props })',
+				);
+			}
+		}
+	}
+	if (onStart !== undefined && typeof onStart !== 'function') fail('onStart must be a function');
 	return record as CloudflareSandboxSettings;
 }
 
@@ -152,6 +192,20 @@ function isInstance(value: unknown): value is CloudflareSandboxInstance {
 	if (typeof value !== 'object' || value === null) return false;
 	const { vcpu, memoryMib, diskMb } = value as Record<string, unknown>;
 	return [vcpu, memoryMib, diskMb].every((n) => typeof n === 'number' && n > 0);
+}
+
+function isIntercept(value: unknown): value is CloudflareSandboxIntercept {
+	if (typeof value !== 'object' || value === null) return false;
+	const v = value as Record<string, unknown>;
+	const matcher =
+		(typeof v.host === 'string' && v.host !== '' && v.all === undefined) ||
+		(v.all === true && v.host === undefined && v.https === undefined);
+	const target = v.target as { fetch?: unknown } | undefined;
+	return (
+		matcher &&
+		typeof target?.fetch === 'function' &&
+		(v.https === undefined || typeof v.https === 'boolean')
+	);
 }
 
 /** Why the workspace was replaced the last time its generation changed. */

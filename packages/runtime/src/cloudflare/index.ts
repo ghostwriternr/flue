@@ -40,6 +40,7 @@ export { extend } from './extension.ts';
 export type {
 	CloudflareSandboxContext,
 	CloudflareSandboxInstance,
+	CloudflareSandboxIntercept,
 	CloudflareSandboxSettings,
 	CloudflareSandboxSettingsInput,
 	CloudflareSandboxSnapshot,
