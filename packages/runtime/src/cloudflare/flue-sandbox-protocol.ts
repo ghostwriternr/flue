@@ -8,6 +8,9 @@
 /** Class name of the Flue-owned Durable Object that runs Cloudflare sandboxes. */
 export const FLUE_SANDBOX_CLASS_NAME = 'FlueSandbox';
 
+/** Durable Object binding `flueWorkerConfig()` adds for `FlueSandbox`. */
+export const FLUE_SANDBOX_BINDING = 'FLUE_SANDBOX';
+
 /** Default idle period before Flue stops a container. */
 export const DEFAULT_IDLE_TIMEOUT_MS = 10 * 60_000;
 

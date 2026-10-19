@@ -26,6 +26,10 @@ export {
 	createCloudflareAgentRuntime,
 } from './cloudflare/agent-coordinator.ts';
 export { createSqlConversationStores } from './cloudflare/agent-execution-store.ts';
+export {
+	FLUE_SANDBOX_BINDING,
+	FLUE_SANDBOX_CLASS_NAME,
+} from './cloudflare/flue-sandbox-protocol.ts';
 // Overflow classifier, exposed for application regression tripwires that
 // assert the 413→overflow chain against the installed runtime (#468). Not an
 // authoring API: agent code never classifies its own failures.
