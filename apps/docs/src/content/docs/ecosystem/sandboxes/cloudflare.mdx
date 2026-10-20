@@ -152,7 +152,7 @@ useSandbox(
 With `persist: true` (the default), the workspace survives idle stops: Flue snapshots the container's root filesystem when it stops it and restores the snapshot at the next start. Installed packages, build caches, and files outside `cwd` all persist.
 
 - A snapshot takes a few seconds and does not pause running commands. Under `vite dev`, snapshots are Docker commits instead: they pause the container while they run, and each one leaves a `workerd-container-snap-*` Docker image behind; remove those with `docker rmi` when you no longer need them.
-- A persisted workspace keeps the image its snapshot was taken from: the snapshot includes the whole root filesystem. Redeploying with a new `Dockerfile` or `image` affects new sandboxes and sandboxes with `persist: false`.
+- A persisted workspace keeps the image its snapshot was taken from: the snapshot includes the whole root filesystem. Redeploying with a new `Dockerfile` or `image` affects new sandboxes, reset sandboxes, and sandboxes with `persist: false`. To move a workspace to a new image, copy the files you need out, `reset()` it, and copy them back.
 - Snapshots expire after Cloudflare's retention period. A sandbox whose snapshot has expired starts with a fresh workspace and the model is told it was reset.
 - With `persist: false`, each stop discards the workspace, and the next start begins from the image.
 
@@ -165,6 +165,22 @@ Agents that attach to the same definition with the same `id` share one sandbox: 
 ```ts
 useSandbox(workspace.attach({ id: `project:${projectId}`, cwd: '/workspace/reviewer' }));
 ```
+
+## Manage a sandbox
+
+`getCloudflareSandbox(harness.sandbox)` returns building blocks for the sandbox an agent runs on. Anywhere in the Worker, such as an admin route, look one up by id on its definition:
+
+```ts
+import { workspace } from './cloudflare.ts';
+
+const sandbox = workspace.get(env, sandboxId);
+const { running, generation } = await sandbox.status();
+```
+
+- `status()` — running state, workspace generation, last workspace change, and the snapshot the next start restores from.
+- `checkpoint()` — take a snapshot now; the next start restores from it.
+- `reset()` — discard the container and its snapshot; the next call starts fresh.
+- `fetch(port, request)` — send an HTTP request to a server in the container, for example a preview.
 
 ## Upgrading from `@cloudflare/sandbox` 0.x
 

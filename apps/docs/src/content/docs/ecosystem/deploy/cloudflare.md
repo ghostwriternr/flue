@@ -432,7 +432,7 @@ export const python = cloudflareSandbox({ image: 'python' });
 export const node = cloudflareSandbox({ image: 'node' });
 ```
 
-A persisted workspace keeps the image its snapshot was taken from.
+A persisted workspace keeps the image its snapshot was taken from until it is reset.
 
 ### When to use a remote sandbox
 

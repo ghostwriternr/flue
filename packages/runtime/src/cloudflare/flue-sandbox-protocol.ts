@@ -50,7 +50,7 @@ export interface CloudflareSandboxContext {
  * the idle timeout at once, the instance type and internet access at the
  * next start, `persist` at the next idle stop, and the image
  * the next time the sandbox boots from it (a persisted workspace keeps the
- * image its snapshot was taken from).
+ * image its snapshot was taken from until `reset()`).
  */
 export interface CloudflareSandboxSettings {
 	/** Key in the container entry's `images` map, or a full image reference. Default: the only configured image, else `cloudflare/debian-trixie`. */
@@ -158,6 +158,20 @@ function isInstance(value: unknown): value is CloudflareSandboxInstance {
 export type CloudflareWorkspaceChange =
 	{ reason: 'restored'; at: string; snapshotCreatedAt: string } | { reason: 'reset'; at: string };
 
+export interface CloudflareSandboxStatus {
+	readonly id: string;
+	/** Export name of the sandbox's definition in `cloudflare.ts`. */
+	readonly definition: string;
+	/** Whether a container is running for this sandbox right now. */
+	readonly running: boolean;
+	/** Increments each time the workspace is restored or reset underneath its users. */
+	readonly generation: number;
+	readonly lastChange?: CloudflareWorkspaceChange;
+	/** The snapshot the next start restores from, if any. */
+	readonly snapshot?: CloudflareSandboxSnapshot;
+	readonly createdAt: string;
+}
+
 /** Result of one command. */
 export interface RpcShellResult {
 	stdout: string;
@@ -193,16 +207,19 @@ export interface RpcNotice {
  */
 const SANDBOX_DIED_TAG = '[flue:sandbox_died:';
 
-export function sandboxDiedMessage(operation: string): string {
-	return `${SANDBOX_DIED_TAG}stopped] Sandbox ${operation} failed: the container stopped while the call was in flight.`;
+export function sandboxDiedMessage(operation: string, reason: 'stopped' | 'reset'): string {
+	return `${SANDBOX_DIED_TAG}${reason}] Sandbox ${operation} failed: the container ${reason === 'reset' ? 'was reset' : 'stopped'} while the call was in flight.`;
 }
 
-export function parseSandboxDied(error: unknown): 'stopped' | undefined {
+export function parseSandboxDied(error: unknown): 'stopped' | 'reset' | undefined {
 	const message = error instanceof Error ? error.message : typeof error === 'string' ? error : '';
-	return message.includes(SANDBOX_DIED_TAG) ? 'stopped' : undefined;
+	const start = message.indexOf(SANDBOX_DIED_TAG);
+	if (start === -1) return undefined;
+	const reason = message.slice(start + SANDBOX_DIED_TAG.length).split(']')[0];
+	return reason === 'reset' ? 'reset' : 'stopped';
 }
 
-/** The `FlueSandbox` RPC surface, as the adapter calls it. */
+/** The `FlueSandbox` RPC surface, as the adapter and the public handle call it. */
 export interface FlueSandboxRpc {
 	ensure(definition: string, id: string, cwd: string): Promise<void>;
 	run(cmdId: string, command: string, options: RpcRunOptions): Promise<RpcShellResult>;
@@ -217,4 +234,8 @@ export interface FlueSandboxRpc {
 	/** The pending workspace notice for an observer, if any; acknowledge it after delivery. */
 	notice(scope: string): Promise<RpcNotice | undefined>;
 	acknowledgeNotice(scope: string, generation: number): Promise<void>;
+	status(): Promise<CloudflareSandboxStatus>;
+	checkpoint(): Promise<CloudflareSandboxSnapshot>;
+	reset(): Promise<void>;
+	fetchPort(port: number, request: Request): Promise<Response>;
 }
