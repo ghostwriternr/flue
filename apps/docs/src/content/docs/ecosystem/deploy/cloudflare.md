@@ -23,7 +23,7 @@ npm install @flue/runtime hono
 npm install -D @flue/vite @cloudflare/vite-plugin vite wrangler
 ```
 
-Flue builds on `agents`, Cloudflare's Agents SDK — it uses the SDK's Durable Object base class and native lifecycle capabilities while retaining ownership of application routing. `@flue/vite` ships the SDK as its own dependency, so each Flue release runs against the SDK minor it was tested with and your project doesn't declare it. To run a different SDK version, add your own `agents` dependency — a copy installed in your project always wins; the generated worker checks at runtime that the SDK provides the durability API Flue relies on (such as `runFiber`) and fails with an explicit error if it does not. If you also need a remote sandbox, additionally install `@cloudflare/sandbox` (see [Connecting a remote sandbox](#connecting-a-remote-sandbox) below).
+Flue builds on `agents`, Cloudflare's Agents SDK — it uses the SDK's Durable Object base class and native lifecycle capabilities while retaining ownership of application routing. `@flue/vite` ships the SDK as its own dependency, so each Flue release runs against the SDK minor it was tested with and your project doesn't declare it. To run a different SDK version, add your own `agents` dependency — a copy installed in your project always wins; the generated worker checks at runtime that the SDK provides the durability API Flue relies on (such as `runFiber`) and fails with an explicit error if it does not. A remote sandbox needs no extra package (see [Connecting a remote sandbox](#connecting-a-remote-sandbox) below).
 
 ```ts title="vite.config.ts"
 import { cloudflare } from '@cloudflare/vite-plugin';
@@ -332,28 +332,22 @@ The agent can use its built-in tools — grep, glob, read — to search and read
 
 The examples above all run on virtual sandboxes — no container needed. But for agents that need a full Linux environment — git, Node.js, a browser, system packages — you want a remote sandbox.
 
-Cloudflare has native container support via [`@cloudflare/sandbox`](https://developers.cloudflare.com/containers/). Each session gets its own isolated container with a persistent filesystem, shell, and full Linux userspace.
+Cloudflare runs containers natively through [Containers](https://developers.cloudflare.com/containers/). Flue's `cloudflareSandbox()` defines a kind of sandbox whose containers run in `FlueSandbox`, a Durable Object that Flue ships. Each sandbox gets its own container and workspace, with a shell and full Linux userspace. See [Cloudflare Sandbox](/docs/ecosystem/sandboxes/cloudflare/) for the full reference.
 
 If you'd rather connect to an external provider — e.g. Daytona — instead of running the sandbox on Cloudflare, see [Connect a Daytona Sandbox](/docs/ecosystem/sandboxes/daytona/).
 
 ### Setup
 
-Containers are a [Workers Paid](https://developers.cloudflare.com/sandbox/platform/pricing/) feature, and local development with `vite dev` needs the Docker daemon running to build and start the container image.
+Containers are a [Workers Paid](https://developers.cloudflare.com/containers/pricing/) feature, and local development with `vite dev` needs the Docker daemon running to build and start the container image. The Cloudflare sandbox needs `@cloudflare/vite-plugin` 1.63 or later and `wrangler` 4.150 or later.
 
-You own the container config. That means four things:
+You own the container config. That means two things:
 
-1. Install `@cloudflare/sandbox`: `npm install @cloudflare/sandbox`.
-2. Export the Sandbox class from `src/cloudflare.ts`.
-3. Declare the Durable Object binding, migration, and container image in your `wrangler.jsonc` at the project root.
-4. Commit a `Dockerfile` at the path your `containers[].image` points to.
+1. Declare the `FlueSandbox` container entry and its migration in your `wrangler.jsonc` at the project root. `flueWorkerConfig()` adds the `FlueSandbox` Durable Object binding and checks the entry.
+2. Commit a `Dockerfile` at the path the entry's `images` map points to.
 
-Append the Sandbox migration to the same top-level history you use for generated Flue classes; do not replace migrations that have already been deployed.
+Append the `FlueSandbox` migration to the same top-level history you use for generated Flue classes; do not replace migrations that have already been deployed.
 
 ### Example
-
-```ts title="src/cloudflare.ts"
-export { Sandbox } from '@cloudflare/sandbox';
-```
 
 `wrangler.jsonc` (at the project root, alongside `package.json`):
 
@@ -363,97 +357,80 @@ export { Sandbox } from '@cloudflare/sandbox';
   "name": "my-agent",
   "compatibility_date": "2026-06-01",
   "compatibility_flags": ["nodejs_compat"],
-  "durable_objects": {
-    "bindings": [{ "class_name": "Sandbox", "name": "Sandbox" }],
-  },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["FlueAssistantAgent"] },
-    { "tag": "v2", "new_sqlite_classes": ["Sandbox"] },
+    { "tag": "v2", "new_sqlite_classes": ["FlueSandbox"] },
   ],
-  "containers": [{ "class_name": "Sandbox", "image": "./Dockerfile" }],
+  "containers": [
+    {
+      "class_name": "FlueSandbox",
+      "name": "my-agent-sandbox",
+      "scheduling_policy": "durable_object",
+      "images": { "default": { "dockerfile": "./Dockerfile" } },
+    },
+  ],
 }
 ```
 
 `Dockerfile` (at the project root):
 
 ```dockerfile
-FROM docker.io/cloudflare/sandbox:0.9.2
+FROM node:24-trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      bash ca-certificates git ripgrep tini procps \
+    && rm -rf /var/lib/apt/lists/*
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["sleep", "infinity"]
 ```
 
-The base image is published by Cloudflare and bundles the control-plane HTTP server that `@cloudflare/sandbox` needs to communicate with the container, along with `node`, `git`, `curl`, and a working directory at `/workspace`. Pin the tag to match the `@cloudflare/sandbox` version in your `package.json` — they're versioned together. Add your own `RUN` lines to install extra tools as needed.
+Flue drives the container through `bash`, coreutils, findutils, and `setsid`, and needs a long-lived main process; `tini` reaps killed processes. Add your own `RUN` lines to install extra tools as needed.
+
+Define the sandbox in `src/cloudflare.ts`. Its export name identifies its sandboxes, so keep it stable:
+
+```typescript title="src/cloudflare.ts"
+import { cloudflareSandbox } from '@flue/runtime/cloudflare';
+
+export const workspace = cloudflareSandbox();
+```
 
 ```typescript title="src/agents/assistant.ts"
 'use agent';
-import { env } from 'cloudflare:workers';
-import { type AgentProps, useModel, useSandbox } from '@flue/runtime';
-import { cloudflareSandbox } from '@flue/runtime/cloudflare';
-import { getSandbox } from '@cloudflare/sandbox';
+import { useModel, useSandbox } from '@flue/runtime';
+import { workspace } from '../cloudflare.ts';
 
-interface Env {
-  Sandbox: DurableObjectNamespace;
-}
-
-export function Assistant({ id }: AgentProps) {
+export function Assistant() {
   useModel('anthropic/claude-opus-4-7');
-  const { Sandbox } = env as unknown as Env;
-  useSandbox(cloudflareSandbox(getSandbox(Sandbox, id)));
+  useSandbox(workspace);
   return 'You have a full Linux sandbox. Use it to complete whatever the user asks.';
 }
 ```
 
-### Multiple sandboxes
+### Multiple images
 
-Different agents can use different container images. Export a separate alias for each Sandbox class, then declare each binding and container entry:
-
-```ts title="src/cloudflare.ts"
-export { Sandbox as PyBoxSandbox } from '@cloudflare/sandbox';
-export { Sandbox as NodeSandbox } from '@cloudflare/sandbox';
-```
+Different kinds of sandbox can use different container images. List each image in the `FlueSandbox` container entry's `images` map:
 
 ```jsonc
 {
-  "durable_objects": {
-    "bindings": [
-      { "class_name": "PyBoxSandbox", "name": "PyBox" },
-      { "class_name": "NodeSandbox", "name": "NodeBox" },
-    ],
-  },
-  "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["FlueAssistantAgent"] },
-    { "tag": "v2", "new_sqlite_classes": ["PyBoxSandbox", "NodeSandbox"] },
-  ],
   "containers": [
-    { "class_name": "PyBoxSandbox", "image": "./docker/python.Dockerfile" },
-    { "class_name": "NodeSandbox", "image": "./docker/node.Dockerfile" },
+    {
+      "class_name": "FlueSandbox",
+      "name": "my-agent-sandbox",
+      "scheduling_policy": "durable_object",
+      "images": {
+        "python": { "dockerfile": "./docker/python.Dockerfile" },
+        "node": { "dockerfile": "./docker/node.Dockerfile" },
+      },
+    },
   ],
 }
 ```
 
-Each agent grabs the sandbox it needs: `cloudflareSandbox(getSandbox(env.PyBox, id))` or `cloudflareSandbox(getSandbox(env.NodeBox, id))`.
+Define one sandbox per image, and give each agent the one it needs:
 
-### Secure egress with outbound Workers
-
-When your agent runs in a container, it may need to call external APIs — GitHub, npm registries, internal services. The traditional approach is to inject API tokens as environment variables, but that means the agent (and the LLM) has direct access to those secrets.
-
-Cloudflare Sandboxes solve this with [outbound Workers](https://blog.cloudflare.com/sandbox-auth/) — a programmable egress proxy that intercepts outgoing HTTP/HTTPS requests from the container. Secrets are injected at the proxy layer, so the container never sees them. This is configured on the Cloudflare Sandbox class, outside of your Flue agent code:
-
-```typescript
-import { Sandbox } from '@cloudflare/sandbox';
-
-export class MySandbox extends Sandbox {
-  static outboundByHost = {
-    'api.github.com': (request, env, ctx) => {
-      const headers = new Headers(request.headers);
-      headers.set('Authorization', `Bearer ${env.GITHUB_TOKEN}`);
-      return fetch(request, { headers });
-    },
-  };
-}
+```typescript title="src/cloudflare.ts"
+export const python = cloudflareSandbox({ image: 'python' });
+export const node = cloudflareSandbox({ image: 'node' });
 ```
-
-This is a zero-trust model — no token is ever granted to the untrusted sandbox. The proxy runs on the same machine as the container, so latency is minimal. You can also use outbound Workers to log requests, block specific domains, or enforce dynamic policies that change over the lifetime of a session.
-
-For full details, see the [outbound Workers documentation](https://developers.cloudflare.com/containers/platform-details/outbound-traffic/).
 
 ### When to use a remote sandbox
 
@@ -554,7 +531,7 @@ Here's the progression of sandbox types available on Cloudflare, from simplest t
 
 1. **Empty virtual sandbox** — an agent function with just `useModel(...)`. Fast, cheap, stateless. Good for prompt-and-response agents.
 2. **Virtual sandbox with shell setup** — Use `harness.sandbox` to write files and configure the workspace. Still fast and cheap, good for agents that need small amounts of static context.
-3. **Container sandbox** — Full Linux environment via `@cloudflare/sandbox`. For coding agents, complex dev environments, and anything that needs real system tools.
+3. **Container sandbox** — Full Linux environment via `cloudflareSandbox()` on Containers. For coding agents, complex dev environments, and anything that needs real system tools.
 
 Start simple. Move up when you need to.
 

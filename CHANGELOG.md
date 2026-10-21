@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### New Features
+
+- **`cloudflareSandbox()` runs on Sandbox SDK 1.0's Durable Object Container API, in a `FlueSandbox` Durable Object that Flue ships.** `@cloudflare/sandbox` 1.0 removed the `Sandbox` Durable Object class that `cloudflareSandbox(getSandbox(...))` wrapped. Declare a `FlueSandbox` container entry (`"scheduling_policy": "durable_object"`, an `images` map) and migration in `wrangler.jsonc`, export a definition such as `export const workspace = cloudflareSandbox()` from `cloudflare.ts`, and pass it to `useSandbox()`; `flueWorkerConfig()` adds the binding and the generated Worker exports the class. No `@cloudflare/sandbox` dependency is needed. A definition's export name and a sandbox id (default: the agent instance id) identify one container and one workspace, and agents that attach with the same `id` through `workspace.attach({ id, cwd, env })` share them. Settings (`image`, `instance` (default `standard-1`), `enableInternet`, `idleTimeoutMs`) are read from code on every container start, so a deploy that changes them reaches existing sandboxes; they may be a function of the sandbox id and `env`. Flue stops a container after `idleTimeoutMs` (10 minutes) without calls or running commands. Aborting a command kills its process group, `timeoutMs` runs inside the container, and commands start from a fixed environment baseline plus `env`. Requires `@cloudflare/vite-plugin` 1.63 and `wrangler` 4.150 or later. The Cloudflare sandbox blueprint is bumped to version 2; run `flue update sandbox cloudflare` and follow its upgrade guide.
+- **Apps can manage Cloudflare sandboxes.** `getCloudflareSandbox(harness.sandbox)` and a definition's `get(env, id)` return `status()`, `reset()`, and `fetch(port, request)`. `SandboxDiedError` gains `reason: 'reset'` for calls that a reset ended.
+
+### Deprecations
+
+- **`cloudflareSandbox(stub)` over a `@cloudflare/sandbox` 0.x `Sandbox` Durable Object stub, `CloudflareSandboxStub`, and `CloudflareSandboxOptions` are deprecated.** They keep working through Flue 2.x with a one-time warning and are removed in 3.0. Upgrading replaces the `Sandbox` class with `FlueSandbox` in one migration; workspaces in 0.x containers do not carry over.
+
 ## 2.3.0 - 2026-10-12
 
 ### New Features
