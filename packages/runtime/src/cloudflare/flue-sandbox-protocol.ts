@@ -137,6 +137,15 @@ function isInstance(value: unknown): value is CloudflareSandboxInstance {
 	return [vcpu, memoryMib, diskMb].every((n) => typeof n === 'number' && n > 0);
 }
 
+export interface CloudflareSandboxStatus {
+	readonly id: string;
+	/** Export name of the sandbox's definition in `cloudflare.ts`. */
+	readonly definition: string;
+	/** Whether a container is running for this sandbox right now. */
+	readonly running: boolean;
+	readonly createdAt: string;
+}
+
 /** Result of one command. */
 export interface RpcShellResult {
 	stdout: string;
@@ -166,16 +175,19 @@ export interface RpcRunOptions {
  */
 const SANDBOX_DIED_TAG = '[flue:sandbox_died:';
 
-export function sandboxDiedMessage(operation: string): string {
-	return `${SANDBOX_DIED_TAG}stopped] Sandbox ${operation} failed: the container stopped while the call was in flight.`;
+export function sandboxDiedMessage(operation: string, reason: 'stopped' | 'reset'): string {
+	return `${SANDBOX_DIED_TAG}${reason}] Sandbox ${operation} failed: the container ${reason === 'reset' ? 'was reset' : 'stopped'} while the call was in flight.`;
 }
 
-export function parseSandboxDied(error: unknown): 'stopped' | undefined {
+export function parseSandboxDied(error: unknown): 'stopped' | 'reset' | undefined {
 	const message = error instanceof Error ? error.message : typeof error === 'string' ? error : '';
-	return message.includes(SANDBOX_DIED_TAG) ? 'stopped' : undefined;
+	const start = message.indexOf(SANDBOX_DIED_TAG);
+	if (start === -1) return undefined;
+	const reason = message.slice(start + SANDBOX_DIED_TAG.length).split(']')[0];
+	return reason === 'reset' ? 'reset' : 'stopped';
 }
 
-/** The `FlueSandbox` RPC surface, as the adapter calls it. */
+/** The `FlueSandbox` RPC surface, as the adapter and the public handle call it. */
 export interface FlueSandboxRpc {
 	ensure(definition: string, id: string, cwd: string): Promise<void>;
 	run(cmdId: string, command: string, options: RpcRunOptions): Promise<RpcShellResult>;
@@ -187,4 +199,7 @@ export interface FlueSandboxRpc {
 	exists(path: string): Promise<boolean>;
 	mkdir(path: string, recursive: boolean): Promise<void>;
 	rm(path: string, recursive: boolean, force: boolean): Promise<void>;
+	status(): Promise<CloudflareSandboxStatus>;
+	reset(): Promise<void>;
+	fetchPort(port: number, request: Request): Promise<Response>;
 }

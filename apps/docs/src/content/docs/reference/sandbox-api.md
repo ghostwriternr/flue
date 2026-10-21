@@ -8,7 +8,7 @@ A sandbox adapter wraps an execution environment — a provider SDK, a container
 
 **The model never calls this surface.** An agent's model-facing file and shell capabilities are the built-in tools — `read` with offset/limit paging, `edit` string replacement, `grep`, `glob` — built on top of it and documented in [Agent Behavior](/docs/reference/agent-behavior/#built-in-tools). This page is for the two audiences underneath: adapter authors implementing a provider, and application code scripting the environment through [`harness.sandbox`](/docs/reference/agent-api/#harnesssandbox).
 
-All symbols on this page are exported from `@flue/runtime`, except `local()` (from `@flue/runtime/node`) and `cloudflareSandbox()` (from `@flue/runtime/cloudflare`). The former names — `SessionEnv`, `SandboxApi`, `SessionToolFactory`, `createSandboxSessionEnv`, and the factory method `createSessionEnv` — remain available as deprecated aliases, so existing adapters keep compiling and running unchanged.
+All symbols on this page are exported from `@flue/runtime`, except `local()` (from `@flue/runtime/node`) and `cloudflareSandbox()` and `getCloudflareSandbox()` (from `@flue/runtime/cloudflare`). The former names — `SessionEnv`, `SandboxApi`, `SessionToolFactory`, `createSandboxSessionEnv`, and the factory method `createSessionEnv` — remain available as deprecated aliases, so existing adapters keep compiling and running unchanged.
 
 ## `SandboxFactory`
 
@@ -146,7 +146,7 @@ interface FileStat {
 
 ### Extending `Sandbox`
 
-An adapter may return a sandbox with additional properties — a native surface beyond the generic verbs. `harness.sandbox` exposes the object exactly as returned, so an adapter package can ship a runtime-checked accessor that narrows to it (the Cloudflare Computer adapter's `computerWorkspace(harness.sandbox)` returns its `Workspace` this way). Two constraints:
+An adapter may return a sandbox with additional properties — a native surface beyond the generic verbs. `harness.sandbox` exposes the object exactly as returned, so an adapter package can ship a runtime-checked accessor that narrows to it (the Cloudflare Computer adapter's `computerWorkspace(harness.sandbox)` returns its `Workspace` this way, and `getCloudflareSandbox(harness.sandbox)` returns its `CloudflareSandboxHandle`). Two constraints:
 
 - A `cwd` override on `useSandbox` wraps the sandbox and drops extra properties ([above](#usesandbox-cwd-scoping)).
 - A sandbox that cannot execute commands should still ship all file verbs and throw from `exec` — and pair the sandbox with a [`tools`](#sandboxtoolfactory) list that omits the exec-backed standard tools.
@@ -403,6 +403,7 @@ interface CloudflareSandboxContext {
 
 interface CloudflareSandboxDefinition extends SandboxFactory {
   attach(options: CloudflareSandboxAttachOptions): SandboxFactory;
+  get(env: object, id: string): CloudflareSandboxHandle;
 }
 
 interface CloudflareSandboxAttachOptions {
@@ -428,7 +429,7 @@ Flue reads settings from the definition on every container start; a function rec
 `useSandbox(definition)` attaches each agent instance to its own sandbox. `definition.attach(options)` returns a factory with options for this agent only:
 
 - `id` — sandbox id. Defaults to the agent instance id. Agents that attach to the same definition with the same id share one sandbox; use separate `cwd` values to keep their files apart.
-- `cwd` — absolute working directory, created on every container start. Defaults to `/workspace`.
+- `cwd` — absolute working directory, created on every container start. Defaults to `/workspace`. Prefer it over a `useSandbox(..., { cwd })` override, which hides it from `getCloudflareSandbox()`.
 - `env` — environment for every command from this agent. Commands start from a fixed baseline (`HOME=/root`, `LANG=C.UTF-8`, `TERM=dumb`, and a Debian `PATH`), then `env`, then the per-call `exec` env. Image `ENV` lines do not apply.
 
 `exec` behavior:
@@ -436,11 +437,32 @@ Flue reads settings from the definition on every container start; a function rec
 - Each command runs in its own process group under `/var/lib/flue/exec/`. A `signal` abort kills the whole group; the call rejects at once, without waiting for the kill to land.
 - `timeoutMs` runs as `timeout(1)` inside the container, so the deadline holds even if a Durable Object restarts; an expired command resolves with `exitCode: 124` (or `137` after the 5-second kill grace).
 - `stdout` and `stderr` each keep the last 1 MiB, with a note when earlier output was dropped. `readFile` rejects files larger than about 32 MiB.
-- A container that stops mid-call rejects with [`SandboxDiedError`](/docs/reference/errors/#sandboxdiederror) (`reason: 'stopped'`). The next call starts the container again.
+- A container that stops mid-call rejects with [`SandboxDiedError`](/docs/reference/errors/#sandboxdiederror) (`reason: 'stopped'`), or `reason: 'reset'` when `reset()` ended it. The next call starts the container again.
 
 Image requirements: `bash`, coreutils, findutils, and util-linux `setsid`, plus a long-lived main process. Use `tini` as the entrypoint so killed processes are reaped.
 
 The 0.x form `cloudflareSandbox(getSandbox(env.Sandbox, id), { cwd })`, which wraps a `@cloudflare/sandbox` 0.x `Sandbox` Durable Object stub (`CloudflareSandboxStub`), still works through Flue 2.x with a deprecation warning and is removed in 3.0.
+
+### `getCloudflareSandbox(sandbox)`
+
+```ts
+import { getCloudflareSandbox } from '@flue/runtime/cloudflare';
+
+function getCloudflareSandbox(sandbox: Sandbox): CloudflareSandboxHandle; // inside an agent: harness.sandbox
+
+interface CloudflareSandboxHandle {
+  readonly id: string;
+  status(): Promise<CloudflareSandboxStatus>;
+  reset(): Promise<void>;
+  fetch(port: number, request: Request): Promise<Response>;
+}
+```
+
+Building blocks for one sandbox. `getCloudflareSandbox(harness.sandbox)` returns them for the sandbox an agent runs on, and throws when the agent runs on a different sandbox or behind a `useSandbox(..., { cwd })` wrapper. Elsewhere in the Worker, `definition.get(env, id)` returns them for a sandbox by id.
+
+- `status()` — whether a container is running, the definition name, and when the sandbox was created. Throws when the sandbox does not exist.
+- `reset()` — destroy the container; the next call starts a fresh workspace from the image. Running commands reject with `SandboxDiedError({ reason: 'reset' })`.
+- `fetch(port, request)` — send an HTTP request to a server listening in the container (for previews). Starts the container if needed.
 
 See [Cloudflare Sandbox](/docs/ecosystem/sandboxes/cloudflare/) for configuration and shared sandboxes.
 

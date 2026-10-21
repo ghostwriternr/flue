@@ -233,7 +233,7 @@ Thrown by `prompt()`, `skill()`, and `task()` when the call set `options.result`
 class SandboxDiedError extends FlueError // type: 'sandbox_died'
 ```
 
-A sandbox call was in flight when the sandbox died, so it can never complete. `meta` carries `operation` and `reason`: `'stopped'` (the sandbox stopped: a crash, eviction, running out of memory, or a destroy), or `'probe_silent'` (the adapter's liveness probe went unanswered). It is not an `AbortError`: shell classification reports an infrastructure failure, not caller cancellation. See the [Sandbox API Reference](/docs/reference/sandbox-api/#sandboxdriver).
+A sandbox call was in flight when the sandbox died, so it can never complete. `meta` carries `operation` and `reason`: `'stopped'` (the sandbox stopped: a crash, eviction, running out of memory, or a destroy), `'probe_silent'` (the adapter's liveness probe went unanswered), or `'reset'` (the sandbox was deliberately reset, for example by a Cloudflare sandbox's `reset()`). It is not an `AbortError`: shell classification reports an infrastructure failure, not caller cancellation. See the [Sandbox API Reference](/docs/reference/sandbox-api/#sandboxdriver).
 
 ## `SandboxOperationUnsupportedError`
 
