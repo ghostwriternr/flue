@@ -19,6 +19,7 @@ import { getCloudflareContext } from './context.ts';
 import {
 	type BrandedDefinition,
 	type CloudflareSandboxSettingsInput,
+	type CloudflareSandboxStatus,
 	DEFINITION,
 	type DefinitionInternals,
 	FLUE_SANDBOX_BINDING,
@@ -55,6 +56,29 @@ export interface CloudflareSandboxAttachOptions {
 export interface CloudflareSandboxDefinition extends SandboxFactory {
 	/** A sandbox factory with attachment options. */
 	attach(options: CloudflareSandboxAttachOptions): SandboxFactory;
+	/** A sandbox of this definition by id, from anywhere in the Worker (for example an admin route). */
+	get(env: object, id: string): CloudflareSandboxHandle;
+}
+
+/**
+ * Building blocks for managing one Cloudflare sandbox, from
+ * {@link getCloudflareSandbox} or {@link CloudflareSandboxDefinition.get}.
+ */
+export interface CloudflareSandboxHandle {
+	readonly id: string;
+	/** Whether a container is running, and the sandbox's definition and creation time. Throws when the sandbox does not exist. */
+	status(): Promise<CloudflareSandboxStatus>;
+	/**
+	 * Destroy the container: the next use starts a fresh workspace from the
+	 * image. Running commands fail with `SandboxDiedError`
+	 * (`reason: 'reset'`).
+	 */
+	reset(): Promise<void>;
+	/**
+	 * Send an HTTP request to a TCP port in the container (for previews).
+	 * Starts the container if needed; the server must already be listening.
+	 */
+	fetch(port: number, request: Request): Promise<Response>;
 }
 
 /**
@@ -113,11 +137,31 @@ export function cloudflareSandbox(
 		[DEFINITION]: internals,
 		createSandbox: ({ id }) => attachSandbox(internals, {}, id),
 		attach,
+		get: (env, id) => createHandle(env, definitionName(internals), id),
 	};
 	return definition;
 }
 
+/**
+ * The sandbox an agent runs on, from its `harness.sandbox`. Throws when the
+ * agent runs on a different sandbox, or when a `useSandbox(..., { cwd })`
+ * override wrapped it (attach with `cwd` instead).
+ */
+export function getCloudflareSandbox(sandbox: Sandbox): CloudflareSandboxHandle {
+	const handle = (sandbox as { [HANDLE]?: unknown })[HANDLE];
+	if (!handle) {
+		throw new Error(
+			'[flue] getCloudflareSandbox(harness.sandbox) requires a cloudflareSandbox() sandbox. ' +
+				'This agent runs on a different sandbox, or a useSandbox(..., { cwd }) override wrapped it; ' +
+				'attach with `cwd` instead. To look a sandbox up by id, call get(env, id) on its definition.',
+		);
+	}
+	return handle as CloudflareSandboxHandle;
+}
+
 // ─── Internals ──────────────────────────────────────────────────────────────
+
+const HANDLE = Symbol.for('@flue/runtime/cloudflare-sandbox');
 
 const ATTACH_KEYS = new Set(['id', 'cwd', 'env']);
 
@@ -183,6 +227,16 @@ function sandboxStub(env: object, definition: string, id: string): FlueSandboxRp
 	return namespace.getByName(`${definition}:${id}`) as FlueSandboxRpc;
 }
 
+function createHandle(env: object, definition: string, id: string): CloudflareSandboxHandle {
+	const stub = sandboxStub(env, definition, id);
+	return {
+		id,
+		status: () => stub.status(),
+		reset: () => stub.reset(),
+		fetch: (port, request) => call('fetch', stub.fetchPort(port, request)),
+	};
+}
+
 /** Await a `FlueSandbox` RPC call, rebuilding `SandboxDiedError` from its RPC-safe tag. */
 async function call<T>(operation: string, reply: Promise<T>): Promise<T> {
 	try {
@@ -200,11 +254,16 @@ async function attachSandbox(
 	instanceId: string,
 ): Promise<Sandbox> {
 	const { id = instanceId, cwd: requestedCwd = '/workspace', env = {} } = options;
+	const workerEnv = getCloudflareContext().env;
 	const name = definitionName(internals);
-	const stub = sandboxStub(getCloudflareContext().env, name, id);
+	const stub = sandboxStub(workerEnv, name, id);
 	const cwd = normalizePath(requestedCwd);
 	await call('start', stub.ensure(name, id, cwd));
-	return sandboxFromDriver(rpcDriver(stub, cwd, env), cwd);
+	const sandbox: Sandbox & { [HANDLE]: CloudflareSandboxHandle } = {
+		...sandboxFromDriver(rpcDriver(stub, cwd, env), cwd),
+		[HANDLE]: createHandle(workerEnv, name, id),
+	};
+	return sandbox;
 }
 
 /** The `FlueSandbox` RPC surface as a {@link SandboxDriver}: paths arrive absolute. */

@@ -18,10 +18,9 @@
  * only the sandbox's identity and the working directories agents attached
  * with.
  *
- * Adapter-facing RPC methods are internal; the public surface is
- * `cloudflareSandbox()` in `cf-sandbox.ts`. Internals use `#private`
- * members because every public method of a Durable Object is callable
- * over RPC.
+ * Adapter-facing RPC methods are internal; the public surface is the
+ * handle in `cf-sandbox.ts`. Internals use `#private` members because
+ * every public method of a Durable Object is callable over RPC.
  *
  * This module imports `cloudflare:workers` and is only reachable from the
  * `@flue/runtime/cloudflare/internal` entry.
@@ -50,6 +49,7 @@ import {
 } from './flue-sandbox-commands.ts';
 import {
 	type CloudflareSandboxInstance,
+	type CloudflareSandboxStatus,
 	DEFAULT_IDLE_TIMEOUT_MS,
 	DEFINITION,
 	type DefinitionInternals,
@@ -107,6 +107,8 @@ class FlueSandbox extends DurableObject<Record<string, unknown>> implements Flue
 	#lastActivity = Date.now();
 	#starting: Promise<void> | undefined;
 	#stopping: Promise<void> | undefined;
+	/** Bumped by `reset()` so in-flight calls can tell a reset from a crash. */
+	#resetEpoch = 0;
 
 	constructor(ctx: DurableObjectState, env: Record<string, unknown>) {
 		super(ctx, env);
@@ -152,13 +154,14 @@ class FlueSandbox extends DurableObject<Record<string, unknown>> implements Flue
 
 	async run(cmdId: string, command: string, options: RpcRunOptions): Promise<RpcShellResult> {
 		return this.#op(async () => {
+			const epoch = this.#resetEpoch;
 			const output = await this.#exec('exec', runArgv(cmdId, command, options));
-			this.#assertAlive('exec');
+			this.#assertAlive('exec', epoch);
 			if (output.exitCode === RECORD_ID_IN_USE_EXIT) {
 				throw new Error(`[flue] Sandbox command id "${cmdId}" is already in use.`);
 			}
 			const result = parseRun(output);
-			if (!result) throw new Error(sandboxDiedMessage('exec'));
+			if (!result) throw new Error(sandboxDiedMessage('exec', 'stopped'));
 			return result;
 		});
 	}
@@ -198,6 +201,39 @@ class FlueSandbox extends DurableObject<Record<string, unknown>> implements Flue
 
 	async rm(path: string, recursive: boolean, force: boolean): Promise<void> {
 		await this.#fileOp('rm', path, rmArgv(path, recursive, force));
+	}
+
+	// ─── Building blocks (behind the public handle) ──────────────────────
+
+	async status(): Promise<CloudflareSandboxStatus> {
+		const state = this.#requireState();
+		return {
+			id: state.id,
+			definition: state.definition,
+			running: this.ctx.container?.running ?? false,
+			createdAt: state.createdAt,
+		};
+	}
+
+	/**
+	 * Destroy the container; the next use starts a fresh workspace from the
+	 * image. Running commands end with `SandboxDiedError({ reason: 'reset' })`.
+	 */
+	async reset(): Promise<void> {
+		this.#requireState();
+		while (this.#stopping || this.#starting) {
+			await (this.#stopping ?? this.#starting)?.catch(() => {});
+		}
+		await this.#stop(async () => {
+			this.#resetEpoch++;
+			const container = this.ctx.container;
+			if (container?.running) await container.destroy();
+		});
+	}
+
+	/** Send an HTTP request to a TCP port in the container (previews). Starts the container. */
+	async fetchPort(port: number, request: Request): Promise<Response> {
+		return this.#op(async () => this.#container.getTcpPort(port).fetch(request));
 	}
 
 	// ─── Supervision ─────────────────────────────────────────────────────
@@ -350,9 +386,9 @@ class FlueSandbox extends DurableObject<Record<string, unknown>> implements Flue
 	}
 
 	/**
-	 * Run an idle stop behind the `#stopping` barrier. `work` claims the
-	 * barrier before its first await, so calls arriving during the stop
-	 * wait for it and then start the container again.
+	 * Run a stop (idle stop or reset) behind the `#stopping` barrier. `work`
+	 * claims the barrier before its first await, so calls arriving during
+	 * the stop wait for it and then start the container again.
 	 */
 	async #stop(work: () => Promise<void>): Promise<void> {
 		const stopping = work();
@@ -442,10 +478,11 @@ class FlueSandbox extends DurableObject<Record<string, unknown>> implements Flue
 
 	/**
 	 * One container exec with the baseline env. A failure while the
-	 * container stopped becomes the RPC-safe sandbox-died error.
+	 * container was reset or stopped becomes the RPC-safe sandbox-died error.
 	 */
 	async #exec(operation: string, argv: string[], stdin?: ReadableStream): Promise<ExecResult> {
 		const container = this.#container;
+		const epoch = this.#resetEpoch;
 		let output: ExecOutput;
 		try {
 			const process = await container.exec(argv, {
@@ -454,10 +491,10 @@ class FlueSandbox extends DurableObject<Record<string, unknown>> implements Flue
 			});
 			output = await process.output();
 		} catch (error) {
-			this.#assertAlive(operation);
+			this.#assertAlive(operation, epoch);
 			throw error;
 		}
-		if (output.exitCode !== 0) this.#assertAlive(operation);
+		if (output.exitCode !== 0) this.#assertAlive(operation, epoch);
 		return {
 			exitCode: output.exitCode,
 			stdout: new Uint8Array(output.stdout),
@@ -477,9 +514,10 @@ class FlueSandbox extends DurableObject<Record<string, unknown>> implements Flue
 		return result;
 	}
 
-	/** Throw the sandbox-died error when the container stopped. */
-	#assertAlive(operation: string): void {
-		if (!this.ctx.container?.running) throw new Error(sandboxDiedMessage(operation));
+	/** Throw the sandbox-died error when the workspace was reset since `epoch`, or the container stopped. */
+	#assertAlive(operation: string, epoch: number): void {
+		if (epoch !== this.#resetEpoch) throw new Error(sandboxDiedMessage(operation, 'reset'));
+		if (!this.ctx.container?.running) throw new Error(sandboxDiedMessage(operation, 'stopped'));
 	}
 }
 
