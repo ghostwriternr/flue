@@ -394,11 +394,14 @@ interface CloudflareSandboxSettings {
   instance?: CloudflareSandboxInstance;
   enableInternet?: boolean;
   idleTimeoutMs?: number;
+  intercepts?: readonly CloudflareSandboxIntercept[];
+  onStart?(container: Container, sandbox: CloudflareSandboxContext): Promise<void> | void;
 }
 
 interface CloudflareSandboxContext {
   readonly id: string;
   readonly env: Cloudflare.Env;
+  readonly exports: Cloudflare.Exports;
 }
 
 interface CloudflareSandboxDefinition extends SandboxFactory {
@@ -417,12 +420,14 @@ Cloudflare target. Defines a kind of sandbox run by `FlueSandbox`, the Durable O
 
 #### `CloudflareSandboxSettings`
 
-Flue reads settings from the definition on every container start; a function receives the sandbox `id` and the Worker `env`. A deploy that changes them reaches existing sandboxes: the idle timeout applies at once, and `image`, `instance`, and `enableInternet` at the next start. Unknown keys and invalid values throw when the definition is created, or at start for a settings function.
+Flue reads settings from the definition on every container start; a function receives the sandbox `id`, the Worker `env`, and the Worker's `exports`. A deploy that changes them reaches existing sandboxes: new intercepts and the idle timeout apply at once, and `image`, `instance`, and `enableInternet` at the next start. Unknown keys and invalid values throw when the definition is created, or at start for a settings function.
 
 - `image` — key in the container entry's `images` map, or a full image reference. Defaults to the only configured image; required when there are several. A container entry without `images` uses `cloudflare/debian-trixie`.
 - `instance` — `'standard-1'` (default) to `'standard-4'`, `'lite'`, or `{ vcpu, memoryMib, diskMb }`. On `lite` (1/16 vCPU, 256 MiB) each command takes most of a second.
 - `enableInternet` — defaults to `true`.
 - `idleTimeoutMs` — idle period before Flue stops the container, discarding its workspace. Defaults to 10 minutes. Idle means no call from any attached agent and no running command.
+- `intercepts` — outbound intercepts applied on every container start: `{ host, https?, target }` routes one hostname (HTTPS too with `https: true`) to a `Fetcher`, and `{ all: true, target }` routes all outbound HTTP. The target is usually an exported entrypoint from a settings function's `exports` (`exports.MyProxy({ props })`, with `props` as its `ctx.props`), or a service binding from `env`. A removed intercept stops applying at the next start.
+- `onStart(container, { id, env, exports })` — runs on every container start, after Flue prepares the container and applies intercepts, before any command. Throwing fails the start.
 
 #### Attaching
 

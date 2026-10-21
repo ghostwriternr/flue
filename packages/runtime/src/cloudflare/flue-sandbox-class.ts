@@ -48,7 +48,10 @@ import {
 	writeFileArgv,
 } from './flue-sandbox-commands.ts';
 import {
+	type CloudflareSandboxContext,
 	type CloudflareSandboxInstance,
+	type CloudflareSandboxIntercept,
+	type CloudflareSandboxSettings,
 	type CloudflareSandboxStatus,
 	DEFAULT_IDLE_TIMEOUT_MS,
 	DEFINITION,
@@ -93,6 +96,8 @@ interface ResolvedSettings {
 	instance: CloudflareSandboxInstance;
 	enableInternet: boolean;
 	idleTimeoutMs: number;
+	intercepts: readonly CloudflareSandboxIntercept[];
+	onStart: CloudflareSandboxSettings['onStart'];
 }
 
 /** Definitions exported from the app's `cloudflare.ts`, by export name. */
@@ -130,6 +135,13 @@ class FlueSandbox extends DurableObject<Record<string, unknown>> implements Flue
 			const deadline = this.#lastActivity + this.#supervision().idleTimeoutMs;
 			const alarm = await ctx.storage.getAlarm();
 			if (alarm === null || alarm > deadline) await ctx.storage.setAlarm(deadline);
+			// A deploy reloads the object without stopping the container:
+			// apply the intercepts of the code now running.
+			try {
+				await this.#applyIntercepts(this.#resolve().intercepts);
+			} catch (error) {
+				console.error('[flue] Sandbox could not apply its intercepts after reloading.', error);
+			}
 		});
 	}
 
@@ -313,7 +325,7 @@ class FlueSandbox extends DurableObject<Record<string, unknown>> implements Flue
 		}
 		const input =
 			typeof definition.settings === 'function'
-				? definition.settings({ id: state.id, env: this.env as Cloudflare.Env })
+				? definition.settings(this.#context())
 				: definition.settings;
 		const settings = validateSettings(input, state.definition);
 		const resolved: ResolvedSettings = {
@@ -323,6 +335,8 @@ class FlueSandbox extends DurableObject<Record<string, unknown>> implements Flue
 			instance: settings.instance ?? 'standard-1',
 			enableInternet: settings.enableInternet ?? true,
 			idleTimeoutMs: settings.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS,
+			intercepts: settings.intercepts ?? [],
+			onStart: settings.onStart,
 		};
 		this.#settings = resolved;
 		return resolved;
@@ -419,6 +433,25 @@ class FlueSandbox extends DurableObject<Record<string, unknown>> implements Flue
 		);
 	}
 
+	/** What a settings function and `onStart` receive. */
+	#context(): CloudflareSandboxContext {
+		return {
+			id: this.#requireState().id,
+			env: this.env as Cloudflare.Env,
+			exports: this.ctx.exports,
+		};
+	}
+
+	async #applyIntercepts(intercepts: readonly CloudflareSandboxIntercept[]): Promise<void> {
+		const container = this.#container;
+		for (const intercept of intercepts) {
+			if ('all' in intercept) await container.interceptAllOutboundHttp(intercept.target);
+			else if (intercept.https) {
+				await container.interceptOutboundHttps(intercept.host, intercept.target);
+			} else await container.interceptOutboundHttp(intercept.host, intercept.target);
+		}
+	}
+
 	#ensureRunning(): Promise<void> {
 		if (this.#starting) return this.#starting;
 		if (this.#container.running) return Promise.resolve();
@@ -457,6 +490,8 @@ class FlueSandbox extends DurableObject<Record<string, unknown>> implements Flue
 			if (prepared.exitCode !== 0) {
 				throw new Error(`[flue] Sandbox container setup failed: ${prepared.stderr.trim()}`);
 			}
+			await this.#applyIntercepts(settings.intercepts);
+			await settings.onStart?.(container, this.#context());
 		} catch (error) {
 			// A container that stopped while starting reports why through
 			// monitor(); the exec that noticed only says it is not running.

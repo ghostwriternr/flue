@@ -38,8 +38,8 @@ export interface CloudflareSandboxAttachOptions {
 	/**
 	 * Extra environment for every command from this agent, layered over the
 	 * baseline (`HOME`, `LANG`, `TERM`, `PATH`). Image `ENV` lines don't
-	 * apply to commands; set variables here. Not for secrets: every
-	 * process in the container can read them.
+	 * apply to commands; set variables here. Not for secrets: use
+	 * `intercepts` to inject credentials outside the container.
 	 */
 	env?: Record<string, string>;
 }
