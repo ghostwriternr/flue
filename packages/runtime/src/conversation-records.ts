@@ -122,7 +122,8 @@ export const RESERVED_SIGNAL_TYPES: ReadonlySet<string> = new Set([
 	'resources',
 	// Instruction-change narration: the composed instruction document moved.
 	'instructions',
-	// Environment-swap narration: a conditional sandbox flip's full snapshot.
+	// Environment narration: a conditional sandbox flip's full snapshot, or a
+	// sandbox-reported workspace change.
 	'environment',
 	// Stream-recovery continuation pair: an agent-authored one would corrupt
 	// resume classification (continuation upgrades key on these records).

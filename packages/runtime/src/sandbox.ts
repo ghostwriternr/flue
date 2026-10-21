@@ -197,6 +197,7 @@ function makeResolvePath(cwd: string): (p: string) => string {
 export function createCwdSandbox(parentEnv: Sandbox, cwd: string): Sandbox {
 	const scopedCwd = normalizePath(cwd);
 	const resolvePath = makeResolvePath(scopedCwd);
+	const workspaceNotice = parentEnv.workspaceNotice?.bind(parentEnv);
 
 	return {
 		exec: (cmd, opts) =>
@@ -216,6 +217,7 @@ export function createCwdSandbox(parentEnv: Sandbox, cwd: string): Sandbox {
 		rm: (p, o) => parentEnv.rm(resolvePath(p), o),
 		cwd: scopedCwd,
 		resolvePath,
+		...(workspaceNotice ? { workspaceNotice } : {}),
 	};
 }
 

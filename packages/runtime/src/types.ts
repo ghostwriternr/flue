@@ -334,6 +334,30 @@ export interface Sandbox {
 	 * for your own logic (e.g., extracting the parent directory).
 	 */
 	resolvePath(p: string): string;
+
+	/**
+	 * Optional: report that the workspace changed underneath an observer —
+	 * for example, it was restored from an earlier snapshot after the
+	 * container was lost, or replaced with a fresh one. `scope` identifies
+	 * the observer (the session passes one per conversation). The first
+	 * call for a scope records a baseline and returns `undefined`; later
+	 * calls return the pending notice until it is acknowledged.
+	 *
+	 * The session calls this at the start of each response and at every
+	 * turn boundary, narrates a returned notice to the model as an
+	 * `environment` signal, and acknowledges it once the signal is durably
+	 * recorded, so the model stops relying on files it saw before the
+	 * change.
+	 */
+	workspaceNotice?(scope: string): Promise<WorkspaceNotice | undefined>;
+}
+
+/** A pending workspace change notice from {@link Sandbox.workspaceNotice}. */
+export interface WorkspaceNotice {
+	/** Model-facing text. */
+	readonly text: string;
+	/** Mark the notice delivered to this scope. Until then it is returned again. */
+	acknowledge(): Promise<void>;
 }
 
 /** @deprecated Renamed to {@link Sandbox}. */
