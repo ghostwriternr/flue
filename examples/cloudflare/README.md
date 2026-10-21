@@ -63,8 +63,8 @@ hydration smoke, use remote resources. You have two options:
 The cloudflare-computer sandbox runs commands in just-bash (a JavaScript
 shell) over a durable Workspace — coreutils and `grep`/`find` work; native
 binaries and `npm` do not. If your account doesn't have Worker Loader
-access, or you need Linux toolchains or writable bucket mounts, use
-`@cloudflare/sandbox` (Containers + `mountBucket`) instead.
+access, or you need Linux toolchains, use the Cloudflare sandbox
+(`cloudflareSandbox()` on Containers) instead.
 
 ### Seeding R2 (skills-from-r2 only)
 
