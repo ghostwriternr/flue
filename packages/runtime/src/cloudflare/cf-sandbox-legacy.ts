@@ -1,4 +1,9 @@
-/** Wraps a @cloudflare/sandbox instance (from getSandbox()) into Sandbox. */
+/**
+ * The deprecated 0.x path: wraps a `@cloudflare/sandbox` 0.x `Sandbox`
+ * Durable Object stub (from `getSandbox()`) into a Flue sandbox. Sandbox SDK
+ * 1.0 removed that Durable Object; `cloudflareSandbox(settings)` definitions
+ * run on `FlueSandbox` instead. Kept through Flue 2.x, removed in 3.0.
+ */
 import { decodeBase64, encodeBase64 } from '../base64.ts';
 import { SandboxDiedError } from '../errors.ts';
 import type { SandboxDriver } from '../sandbox.ts';
@@ -6,11 +11,13 @@ import { sandboxFromDriver } from '../sandbox.ts';
 import type { Sandbox, SandboxFactory } from '../types.ts';
 
 /**
- * Minimal structural surface of a `@cloudflare/sandbox` Durable Object stub
- * (the value returned by `getSandbox()`). Kept structural so `@flue/runtime`
- * does not depend on `@cloudflare/sandbox` and stays importable on Node;
- * only the methods Flue calls are listed. A wrong object fails loudly on
- * the first method call.
+ * Minimal structural surface of a `@cloudflare/sandbox` 0.x `Sandbox`
+ * Durable Object stub (the value returned by `getSandbox()`). Kept
+ * structural so `@flue/runtime` does not depend on `@cloudflare/sandbox`;
+ * only the methods Flue calls are listed.
+ *
+ * @deprecated Export a `cloudflareSandbox(settings)` definition, which
+ * runs on `FlueSandbox`. Removed in Flue 3.0.
  */
 export interface CloudflareSandboxStub {
 	exec(
@@ -35,27 +42,29 @@ export interface CloudflareSandboxStub {
 	getState(): Promise<{ status: string }>;
 }
 
+/**
+ * Options of the deprecated `cloudflareSandbox(stub, options)` form.
+ *
+ * @deprecated Attach to a `cloudflareSandbox(settings)` definition with
+ * `attach({ cwd })`. Removed in Flue 3.0.
+ */
 export interface CloudflareSandboxOptions {
 	/** Working directory inside the container. Defaults to `/workspace`. */
 	cwd?: string;
 }
 
-/**
- * Wrap a Cloudflare Sandbox Durable Object stub into a Flue
- * {@link SandboxFactory}:
- *
- * ```ts
- * import { getSandbox } from '@cloudflare/sandbox';
- * import { env } from 'cloudflare:workers';
- * import { cloudflareSandbox } from '@flue/runtime/cloudflare';
- *
- * export function MyAgent({ id }: AgentProps) {
- *   useSandbox(cloudflareSandbox(getSandbox(env.Sandbox, id)));
- *   return '…';
- * }
- * ```
- */
-export function cloudflareSandbox(
+/** Whether `value` is a 0.x `Sandbox` stub rather than sandbox settings. */
+export function isCloudflareSandboxStub(value: unknown): value is CloudflareSandboxStub {
+	// RPC stubs are proxies: accept either typeof, then probe the methods.
+	return (
+		(typeof value === 'object' || typeof value === 'function') &&
+		value !== null &&
+		typeof (value as { exec?: unknown }).exec === 'function' &&
+		typeof (value as { getState?: unknown }).getState === 'function'
+	);
+}
+
+export function legacyCloudflareSandbox(
 	sandbox: CloudflareSandboxStub,
 	options?: CloudflareSandboxOptions,
 ): SandboxFactory {
@@ -169,8 +178,7 @@ function raceContainerDeath<T>(
 	});
 }
 
-// Module-private: only cloudflareSandbox() above uses it, and the entry-point
-// tests assert it stays off the cloudflare and internal barrels.
+// Module-private: only legacyCloudflareSandbox() above uses it.
 function cfSandboxToSandbox(sandbox: CloudflareSandboxStub, cwd: string = '/workspace'): Sandbox {
 	// Every container call goes through the death detector so a call that is
 	// in flight when the container dies settles instead of hanging forever.

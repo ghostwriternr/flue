@@ -18,9 +18,10 @@
  * only the sandbox's identity and the working directories agents attached
  * with.
  *
- * Its RPC methods (`flue-sandbox-protocol.ts`) are internal to Flue.
- * Internals use `#private` members because every public method of a
- * Durable Object is callable over RPC.
+ * Adapter-facing RPC methods are internal; the public surface is
+ * `cloudflareSandbox()` in `cf-sandbox.ts`. Internals use `#private`
+ * members because every public method of a Durable Object is callable
+ * over RPC.
  *
  * This module imports `cloudflare:workers` and is only reachable from the
  * `@flue/runtime/cloudflare/internal` entry.

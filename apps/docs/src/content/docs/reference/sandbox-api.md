@@ -142,7 +142,7 @@ interface FileStat {
 ```
 
 - `isSymbolicLink`, `size`, and `mtime` are omitted when the provider does not expose them. Adapters must never fabricate placeholder values (`new Date()`, `0`, `false`) — callers cannot distinguish them from real metadata.
-- For symlinks, `isFile`/`isDirectory`/`size`/`mtime` describe the target and `isSymbolicLink` describes the path itself (the semantics of `stat -L` plus a non-following check; `local()` and the Cloudflare Sandbox adapter both implement this).
+- For symlinks, `isFile`/`isDirectory`/`size`/`mtime` describe the target and `isSymbolicLink` describes the path itself (the semantics of `stat -L` plus a non-following check; `local()` and the Cloudflare sandbox adapter both implement this).
 
 ### Extending `Sandbox`
 
@@ -229,11 +229,11 @@ File-verb implementation notes:
 
 Liveness contract (all `SandboxDriver` methods):
 
-- An adapter should ensure in-flight operations settle when the sandbox dies, by whatever mechanism its provider SDK supports — native rejection of in-flight calls, or polling a cheap control-plane status read while a call is pending. The first-party Cloudflare adapter implements the polling shape internally.
+- An adapter should ensure in-flight operations settle when the sandbox dies, by whatever mechanism its provider SDK supports — native rejection of in-flight calls, or polling a cheap control-plane status read while a call is pending.
 - An adapter with no such mechanism carries an accepted limitation: when the provider transport never settles a call after the sandbox dies, that call may hang until the surrounding operation is aborted.
 - There is deliberately no per-command deadline in this contract. Agent commands are legitimately unbounded; `timeoutMs` is the command's own deadline, not an infrastructure liveness bound.
 - An adapter that detects sandbox death should reject with `SandboxDiedError` (`type: 'sandbox_died'`, exported from `@flue/runtime`), so shell classification reports an infrastructure failure rather than caller cancellation.
-- Liveness detection and caller abort are separate concerns implemented at different layers, and a death detector must not blur them: it races the sandbox's liveness signal against the in-flight provider call and nothing else. `sandboxFromDriver` already races `signal` one layer up and consumes the provider promise's eventual settlement once the caller has been released, so a death detector that also listens for `signal` produces two rejections competing for the same promise. The first-party Cloudflare adapter's death detector follows this split — liveness-only, with the caller-abort race left entirely to the wrapper it builds on.
+- Liveness detection and caller abort are separate concerns implemented at different layers, and a death detector must not blur them: it races the sandbox's liveness signal against the in-flight provider call and nothing else. `sandboxFromDriver` already races `signal` one layer up and consumes the provider promise's eventual settlement once the caller has been released, so a death detector that also listens for `signal` produces two rejections competing for the same promise.
 
 ## `bash(factory)`
 
@@ -379,26 +379,70 @@ Environment allowlist: the model's shell does not inherit `process.env`. Only `P
 
 `stat` reports `isFile`/`isDirectory`/`size`/`mtime` for the symlink target and `isSymbolicLink` for the path itself. All `FileStat` fields are populated.
 
-### `cloudflareSandbox(sandbox, options?)`
+### `cloudflareSandbox(settings?)`
 
 ```ts
 import { cloudflareSandbox } from '@flue/runtime/cloudflare';
 
 function cloudflareSandbox(
-  sandbox: CloudflareSandboxStub,
-  options?: CloudflareSandboxOptions,
-): SandboxFactory;
+  settings?:
+    CloudflareSandboxSettings | ((sandbox: CloudflareSandboxContext) => CloudflareSandboxSettings),
+): CloudflareSandboxDefinition;
 
-interface CloudflareSandboxOptions {
+interface CloudflareSandboxSettings {
+  image?: string;
+  instance?: CloudflareSandboxInstance;
+  enableInternet?: boolean;
+  idleTimeoutMs?: number;
+}
+
+interface CloudflareSandboxContext {
+  readonly id: string;
+  readonly env: Cloudflare.Env;
+}
+
+interface CloudflareSandboxDefinition extends SandboxFactory {
+  attach(options: CloudflareSandboxAttachOptions): SandboxFactory;
+}
+
+interface CloudflareSandboxAttachOptions {
+  id?: string;
   cwd?: string;
+  env?: Record<string, string>;
 }
 ```
 
-Cloudflare target. Wraps a `@cloudflare/sandbox` Durable Object stub (the value `getSandbox()` returns) into a `SandboxFactory`. `CloudflareSandboxStub` is structural, so `@flue/runtime` does not depend on `@cloudflare/sandbox`.
+Cloudflare target. Defines a kind of sandbox run by `FlueSandbox`, the Durable Object Flue ships to run [Containers](https://developers.cloudflare.com/containers/) on the `durable_object` scheduling policy. Export the definition from `cloudflare.ts`: its export name and a sandbox id identify each sandbox, and one `FlueSandbox` instance owns that sandbox's container and workspace. Using a definition that `cloudflare.ts` does not export throws. `@flue/runtime` does not depend on `@cloudflare/sandbox`: commands and file verbs all run through the container's `exec`.
 
-- `cwd` — working directory inside the container. Defaults to `/workspace`.
+#### `CloudflareSandboxSettings`
 
-See [Cloudflare Sandbox](/docs/guide/cloudflare-target/#cloudflare-sandbox) in the target guide and the [ecosystem entry](/docs/ecosystem/sandboxes/cloudflare/).
+Flue reads settings from the definition on every container start; a function receives the sandbox `id` and the Worker `env`. A deploy that changes them reaches existing sandboxes: the idle timeout applies at once, and `image`, `instance`, and `enableInternet` at the next start. Unknown keys and invalid values throw when the definition is created, or at start for a settings function.
+
+- `image` — key in the container entry's `images` map, or a full image reference. Defaults to the only configured image; required when there are several. A container entry without `images` uses `cloudflare/debian-trixie`.
+- `instance` — `'standard-1'` (default) to `'standard-4'`, `'lite'`, or `{ vcpu, memoryMib, diskMb }`. On `lite` (1/16 vCPU, 256 MiB) each command takes most of a second.
+- `enableInternet` — defaults to `true`.
+- `idleTimeoutMs` — idle period before Flue stops the container, discarding its workspace. Defaults to 10 minutes. Idle means no call from any attached agent and no running command.
+
+#### Attaching
+
+`useSandbox(definition)` attaches each agent instance to its own sandbox. `definition.attach(options)` returns a factory with options for this agent only:
+
+- `id` — sandbox id. Defaults to the agent instance id. Agents that attach to the same definition with the same id share one sandbox; use separate `cwd` values to keep their files apart.
+- `cwd` — absolute working directory, created on every container start. Defaults to `/workspace`.
+- `env` — environment for every command from this agent. Commands start from a fixed baseline (`HOME=/root`, `LANG=C.UTF-8`, `TERM=dumb`, and a Debian `PATH`), then `env`, then the per-call `exec` env. Image `ENV` lines do not apply.
+
+`exec` behavior:
+
+- Each command runs in its own process group under `/var/lib/flue/exec/`. A `signal` abort kills the whole group; the call rejects at once, without waiting for the kill to land.
+- `timeoutMs` runs as `timeout(1)` inside the container, so the deadline holds even if a Durable Object restarts; an expired command resolves with `exitCode: 124` (or `137` after the 5-second kill grace).
+- `stdout` and `stderr` each keep the last 1 MiB, with a note when earlier output was dropped. `readFile` rejects files larger than about 32 MiB.
+- A container that stops mid-call rejects with [`SandboxDiedError`](/docs/reference/errors/#sandboxdiederror) (`reason: 'stopped'`). The next call starts the container again.
+
+Image requirements: `bash`, coreutils, findutils, and util-linux `setsid`, plus a long-lived main process. Use `tini` as the entrypoint so killed processes are reaped.
+
+The 0.x form `cloudflareSandbox(getSandbox(env.Sandbox, id), { cwd })`, which wraps a `@cloudflare/sandbox` 0.x `Sandbox` Durable Object stub (`CloudflareSandboxStub`), still works through Flue 2.x with a deprecation warning and is removed in 3.0.
+
+See [Cloudflare Sandbox](/docs/ecosystem/sandboxes/cloudflare/) for configuration and shared sandboxes.
 
 ## `SandboxOperationUnsupportedError`
 
