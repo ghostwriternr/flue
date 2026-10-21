@@ -171,9 +171,9 @@ export function classifySignal(signalType: string): {
 		// Instruction-change narration: the composed instruction document
 		// moved between renders; announcement only, same bookkeeping family.
 		case 'instructions':
-		// Environment-swap narration: a conditional sandbox attached, detached,
-		// or was replaced at a turn boundary; full-snapshot announcement, same
-		// bookkeeping family.
+		// Environment narration: a conditional sandbox attached, detached, or
+		// was replaced at a turn boundary (full-snapshot announcement), or the
+		// sandbox reported a workspace change; same bookkeeping family.
 		case 'environment':
 			return { purpose: 'advisory', display: 'diagnostic' };
 		default:

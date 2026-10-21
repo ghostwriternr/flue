@@ -81,6 +81,8 @@ interface Sandbox {
 
   cwd: string;
   resolvePath(p: string): string;
+
+  workspaceNotice?(scope: string): Promise<WorkspaceNotice | undefined>;
 }
 ```
 
@@ -118,6 +120,22 @@ Runs a shell command and resolves with its output.
 - `rm(path, options)` — removes a file or directory; `recursive` removes directory contents, `force` suppresses the missing-path error. An adapter whose provider cannot honor a requested option must throw [`SandboxOperationUnsupportedError`](#sandboxoperationunsupportederror) before modifying anything — never silently ignore an option or leave its behavior provider-defined.
 
 Errors thrown by file verbs surface to the model as tool errors, so messages should be factual and self-contained (the standard tools pass them through).
+
+### `workspaceNotice`
+
+Optional. A sandbox whose workspace can change underneath the conversation — restored from an earlier snapshot after the container was lost, or replaced with a fresh one — implements it to tell the model.
+
+```ts
+interface WorkspaceNotice {
+  readonly text: string;
+  acknowledge(): Promise<void>;
+}
+```
+
+- `scope` — identifies the observer. The session passes one value per conversation.
+- The first call for a scope records a baseline and resolves `undefined`. After a change, calls resolve the pending notice until it is acknowledged, and `undefined` otherwise.
+- The session calls it at the start of each response and at every turn boundary, narrates `text` as an `environment` signal, then calls `acknowledge()` once the signal is durably recorded. A crash in between repeats the notice instead of losing it. Rejections are ignored.
+- A `useSandbox(..., { cwd })` wrapper forwards it.
 
 ### `ShellResult`
 
