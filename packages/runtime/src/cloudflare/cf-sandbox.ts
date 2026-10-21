@@ -19,6 +19,7 @@ import { getCloudflareContext } from './context.ts';
 import {
 	type BrandedDefinition,
 	type CloudflareSandboxSettingsInput,
+	type CloudflareSandboxSnapshot,
 	type CloudflareSandboxStatus,
 	DEFINITION,
 	type DefinitionInternals,
@@ -66,12 +67,14 @@ export interface CloudflareSandboxDefinition extends SandboxFactory {
  */
 export interface CloudflareSandboxHandle {
 	readonly id: string;
-	/** Whether a container is running, and the sandbox's definition and creation time. Throws when the sandbox does not exist. */
+	/** Running state, workspace generation, and the snapshot the next start restores from. Throws when the sandbox does not exist. */
 	status(): Promise<CloudflareSandboxStatus>;
+	/** Take a snapshot now and make it the one the next start restores from. */
+	checkpoint(): Promise<CloudflareSandboxSnapshot>;
 	/**
-	 * Destroy the container: the next use starts a fresh workspace from the
-	 * image. Running commands fail with `SandboxDiedError`
-	 * (`reason: 'reset'`).
+	 * Destroy the container and forget its snapshot: the next use starts a
+	 * fresh workspace from the image. Running commands fail with
+	 * `SandboxDiedError` (`reason: 'reset'`).
 	 */
 	reset(): Promise<void>;
 	/**
@@ -232,6 +235,7 @@ function createHandle(env: object, definition: string, id: string): CloudflareSa
 	return {
 		id,
 		status: () => stub.status(),
+		checkpoint: () => call('checkpoint', stub.checkpoint()),
 		reset: () => stub.reset(),
 		fetch: (port, request) => call('fetch', stub.fetchPort(port, request)),
 	};
@@ -261,6 +265,16 @@ async function attachSandbox(
 	await call('start', stub.ensure(name, id, cwd));
 	const sandbox: Sandbox & { [HANDLE]: CloudflareSandboxHandle } = {
 		...sandboxFromDriver(rpcDriver(stub, cwd, env), cwd),
+		async workspaceNotice(scope) {
+			// Ask every time: another agent sharing the sandbox, or a crash,
+			// can change the workspace without any call from this agent.
+			const notice = await stub.notice(scope);
+			if (!notice) return undefined;
+			return {
+				text: notice.text,
+				acknowledge: () => stub.acknowledgeNotice(scope, notice.generation),
+			};
+		},
 		[HANDLE]: createHandle(workerEnv, name, id),
 	};
 	return sandbox;

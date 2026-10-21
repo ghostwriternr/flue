@@ -5,18 +5,21 @@
  * Containers on the `durable_object` scheduling policy belong to a Durable
  * Object, and nothing else runs their lifecycle. `FlueSandbox` does:
  *
- * - start: from the sandbox's image, on the first call after a stop;
+ * - start: from the workspace's snapshot when it has one, else its image;
  * - idle stop: when no client call or command is in flight for the idle
- *   period, destroy the container, which discards its workspace;
+ *   period, snapshot the root filesystem (when the sandbox persists), then
+ *   destroy the container;
  * - commands: every command runs as a record in its own process group
  *   (`flue-sandbox-commands.ts`), so it can be killed as a whole and
- *   outlives either Durable Object restarting.
+ *   outlives either Durable Object restarting;
+ * - unexpected loss: restore the last snapshot (or start fresh) and bump
+ *   the workspace generation, which agents surface to the model.
  *
  * Settings are code, not state: each instance resolves them from its
  * definition (exported from the app's `cloudflare.ts`) when it loads and
  * on every start, so a deploy reaches existing sandboxes. Storage holds
- * only the sandbox's identity and the working directories agents attached
- * with.
+ * only the sandbox's identity and workspace state: attached working
+ * directories, lifecycle phase, generation, and snapshot.
  *
  * Adapter-facing RPC methods are internal; the public surface is the
  * handle in `cf-sandbox.ts`. Internals use `#private` members because
@@ -52,7 +55,9 @@ import {
 	type CloudflareSandboxInstance,
 	type CloudflareSandboxIntercept,
 	type CloudflareSandboxSettings,
+	type CloudflareSandboxSnapshot,
 	type CloudflareSandboxStatus,
+	type CloudflareWorkspaceChange,
 	DEFAULT_IDLE_TIMEOUT_MS,
 	DEFINITION,
 	type DefinitionInternals,
@@ -60,6 +65,7 @@ import {
 	type FlueSandboxRpc,
 	isSandboxDefinition,
 	type RpcFileStat,
+	type RpcNotice,
 	type RpcRunOptions,
 	type RpcShellResult,
 	sandboxDiedMessage,
@@ -79,6 +85,23 @@ const DEFAULT_ENTRYPOINT = ['sleep', 'infinity'];
 const STATE_KEY = 'flue:sandbox';
 /** Time of the last client call. Stored because the Durable Object is evicted while its container idles. */
 const ACTIVITY_KEY = 'flue:activity';
+const SEEN_KEY_PREFIX = 'flue:seen:';
+
+/**
+ * Where the workspace's container lifecycle stands, which decides what the
+ * next start boots from:
+ *
+ * - `stopped`: never started, or Flue stopped it (idle stop or reset);
+ *   boot from the current snapshot, else the image.
+ * - `started`: Flue started it and has not stopped it; a container that is
+ *   not running was lost, which the next start or notice check records as
+ *   a workspace change before moving to `stopped`.
+ *
+ * A container still running outside `started` is left over from a stop
+ * that saved its state but did not destroy the container (the object was
+ * evicted, or `destroy()` failed); Flue destroys it rather than use it.
+ */
+type LifecyclePhase = 'started' | 'stopped';
 
 interface SandboxState {
 	/** Export name of the definition; with `id`, the sandbox's identity. */
@@ -87,6 +110,11 @@ interface SandboxState {
 	createdAt: string;
 	/** Working directories agents attached with; created on every start. */
 	cwds: string[];
+	phase: LifecyclePhase;
+	generation: number;
+	lastChange?: CloudflareWorkspaceChange;
+	/** The snapshot the next start restores from. */
+	snapshot?: CloudflareSandboxSnapshot;
 }
 
 /** A definition's settings with defaults applied and validated. */
@@ -95,6 +123,7 @@ interface ResolvedSettings {
 	image: string | undefined;
 	instance: CloudflareSandboxInstance;
 	enableInternet: boolean;
+	persist: boolean;
 	idleTimeoutMs: number;
 	intercepts: readonly CloudflareSandboxIntercept[];
 	onStart: CloudflareSandboxSettings['onStart'];
@@ -123,7 +152,7 @@ class FlueSandbox extends DurableObject<Record<string, unknown>> implements Flue
 			if (stored !== undefined) this.#lastActivity = stored;
 			else if (this.#state) await ctx.storage.put(ACTIVITY_KEY, this.#lastActivity);
 			const container = ctx.container;
-			if (!container?.running || !this.#state) return;
+			if (!container?.running || this.#state?.phase !== 'started') return;
 			// The platform inactivity timeout does not survive a Durable
 			// Object restart: without re-arming it, a running container
 			// stops shortly after the reload. Re-arm it for what is
@@ -215,6 +244,37 @@ class FlueSandbox extends DurableObject<Record<string, unknown>> implements Flue
 		await this.#fileOp('rm', path, rmArgv(path, recursive, force));
 	}
 
+	/**
+	 * The workspace notice for one observer: `undefined` on first contact
+	 * (which records the baseline) and while nothing changed, otherwise the
+	 * notice for the latest change until the observer acknowledges it.
+	 */
+	async notice(scope: string): Promise<RpcNotice | undefined> {
+		const state = this.#state;
+		if (!state) return undefined;
+		// Record a lost container now rather than at the next start, so the
+		// model hears about the rollback before its next command.
+		if (state.phase === 'started' && !this.ctx.container?.running) {
+			await this.#recordLoss(state);
+		}
+		const key = `${SEEN_KEY_PREFIX}${scope}`;
+		const seen = await this.ctx.storage.get<number>(key);
+		const generation = state.generation;
+		if (seen === undefined) {
+			await this.ctx.storage.put(key, generation);
+			return undefined;
+		}
+		if (seen >= generation || !state.lastChange) return undefined;
+		return { generation, text: renderNotice(state.lastChange) };
+	}
+
+	/** Record that an observer was told about the workspace up to `generation`. */
+	async acknowledgeNotice(scope: string, generation: number): Promise<void> {
+		const key = `${SEEN_KEY_PREFIX}${scope}`;
+		const seen = await this.ctx.storage.get<number>(key);
+		if (seen === undefined || seen < generation) await this.ctx.storage.put(key, generation);
+	}
+
 	// ─── Building blocks (behind the public handle) ──────────────────────
 
 	async status(): Promise<CloudflareSandboxStatus> {
@@ -223,21 +283,34 @@ class FlueSandbox extends DurableObject<Record<string, unknown>> implements Flue
 			id: state.id,
 			definition: state.definition,
 			running: this.ctx.container?.running ?? false,
+			generation: state.generation,
+			...(state.lastChange ? { lastChange: state.lastChange } : {}),
+			...(state.snapshot ? { snapshot: state.snapshot } : {}),
 			createdAt: state.createdAt,
 		};
 	}
 
+	/** Take a snapshot now and make it the one the next start restores from. */
+	async checkpoint(): Promise<CloudflareSandboxSnapshot> {
+		return this.#op(() => this.#takeSnapshot());
+	}
+
 	/**
-	 * Destroy the container; the next use starts a fresh workspace from the
-	 * image. Running commands end with `SandboxDiedError({ reason: 'reset' })`.
+	 * Destroy the container and forget its snapshot; the next use starts a
+	 * fresh workspace from the image. Running commands end with
+	 * `SandboxDiedError({ reason: 'reset' })`.
 	 */
 	async reset(): Promise<void> {
-		this.#requireState();
+		const state = this.#requireState();
 		while (this.#stopping || this.#starting) {
 			await (this.#stopping ?? this.#starting)?.catch(() => {});
 		}
 		await this.#stop(async () => {
 			this.#resetEpoch++;
+			state.snapshot = undefined;
+			state.phase = 'stopped';
+			recordChange(state, { reason: 'reset', at: new Date().toISOString() });
+			await this.#save();
 			const container = this.ctx.container;
 			if (container?.running) await container.destroy();
 		});
@@ -256,6 +329,13 @@ class FlueSandbox extends DurableObject<Record<string, unknown>> implements Flue
 		if (!state || !container?.running) return;
 		if (this.#busy()) {
 			await this.ctx.storage.setAlarm(Date.now() + KEEPALIVE_MS);
+			return;
+		}
+		if (state.phase !== 'started') {
+			// Left over from an unfinished stop (see LifecyclePhase).
+			await container.destroy().catch(async () => {
+				await this.ctx.storage.setAlarm(Date.now() + STOP_RETRY_MS);
+			});
 			return;
 		}
 		let running: number;
@@ -334,6 +414,7 @@ class FlueSandbox extends DurableObject<Record<string, unknown>> implements Flue
 			// take most of a second.
 			instance: settings.instance ?? 'standard-1',
 			enableInternet: settings.enableInternet ?? true,
+			persist: settings.persist ?? true,
 			idleTimeoutMs: settings.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS,
 			intercepts: settings.intercepts ?? [],
 			onStart: settings.onStart,
@@ -344,13 +425,13 @@ class FlueSandbox extends DurableObject<Record<string, unknown>> implements Flue
 
 	/**
 	 * What supervision needs, even when the settings no longer resolve: a
-	 * running container must still stop when idle.
+	 * running container must still stop when idle, and keeps its workspace.
 	 */
-	#supervision(): { idleTimeoutMs: number } {
+	#supervision(): { idleTimeoutMs: number; persist: boolean } {
 		try {
 			return this.#resolve();
 		} catch {
-			return { idleTimeoutMs: DEFAULT_IDLE_TIMEOUT_MS };
+			return { idleTimeoutMs: DEFAULT_IDLE_TIMEOUT_MS, persist: true };
 		}
 	}
 
@@ -454,7 +535,9 @@ class FlueSandbox extends DurableObject<Record<string, unknown>> implements Flue
 
 	#ensureRunning(): Promise<void> {
 		if (this.#starting) return this.#starting;
-		if (this.#container.running) return Promise.resolve();
+		if (this.#container.running && this.#requireState().phase === 'started') {
+			return Promise.resolve();
+		}
 		this.#starting = this.#start().finally(() => {
 			this.#starting = undefined;
 		});
@@ -462,19 +545,37 @@ class FlueSandbox extends DurableObject<Record<string, unknown>> implements Flue
 	}
 
 	async #start(): Promise<void> {
+		const state = this.#requireState();
+		const container = this.#container;
+		if (state.phase === 'started') await this.#recordLoss(state);
+		// Left over from an unfinished stop (see LifecyclePhase).
+		else if (container.running) await container.destroy();
 		// Settings may be computed: resolve them for this start.
 		this.#settings = undefined;
-		await this.#boot();
+		const snapshot = state.snapshot;
+		try {
+			await this.#boot(snapshot);
+		} catch (error) {
+			if (!snapshot || !isSnapshotMissing(error)) throw error;
+			// Expired or missing: start fresh from the image.
+			state.snapshot = undefined;
+			recordChange(state, { reason: 'reset', at: new Date().toISOString() });
+			await this.#boot(undefined);
+		}
+		state.phase = 'started';
+		await this.#save();
 		await this.#touch();
 		await this.ctx.storage.setAlarm(Date.now() + this.#resolve().idleTimeoutMs);
 	}
 
-	async #boot(): Promise<void> {
+	async #boot(snapshot: CloudflareSandboxSnapshot | undefined): Promise<void> {
 		const state = this.#requireState();
 		const settings = this.#resolve();
 		const container = this.#container;
 		container.start({
-			image: settings.image ?? DEFAULT_IMAGE,
+			...(snapshot
+				? { containerSnapshot: { id: snapshot.id } }
+				: { image: settings.image ?? DEFAULT_IMAGE }),
 			enableInternet: settings.enableInternet,
 			instance: settings.instance,
 			// The default image has no long-lived main process of its own.
@@ -501,10 +602,63 @@ class FlueSandbox extends DurableObject<Record<string, unknown>> implements Flue
 		}
 	}
 
+	/**
+	 * The container was lost without Flue stopping it (a crash, running out
+	 * of memory, eviction, or the inactivity backstop): the next start rolls
+	 * back to the last snapshot, or the image, and the workspace's users are
+	 * told.
+	 */
+	async #recordLoss(state: SandboxState): Promise<void> {
+		const at = new Date().toISOString();
+		recordChange(
+			state,
+			state.snapshot
+				? { reason: 'restored', at, snapshotCreatedAt: state.snapshot.createdAt }
+				: { reason: 'reset', at },
+		);
+		state.phase = 'stopped';
+		await this.#save();
+	}
+
+	async #takeSnapshot(): Promise<CloudflareSandboxSnapshot> {
+		const state = this.#requireState();
+		const epoch = this.#resetEpoch;
+		const taken = await this.#container.snapshotContainer();
+		// A reset while the snapshot was taken discarded this workspace.
+		if (epoch !== this.#resetEpoch) throw new Error(sandboxDiedMessage('checkpoint', 'reset'));
+		const snapshot: CloudflareSandboxSnapshot = {
+			id: taken.id,
+			size: taken.size,
+			createdAt: new Date().toISOString(),
+		};
+		state.snapshot = snapshot;
+		await this.#save();
+		return snapshot;
+	}
+
 	async #idleStop(): Promise<void> {
+		const state = this.#requireState();
 		const container = this.#container;
 		try {
-			await this.#stop(() => container.destroy());
+			await this.#stop(async () => {
+				if (this.#supervision().persist) {
+					// Snapshots are point-in-time and don't pause the container,
+					// so a request racing the stop can't tear the workspace.
+					await this.#takeSnapshot();
+				} else {
+					state.snapshot = undefined;
+					recordChange(state, { reason: 'reset', at: new Date().toISOString() });
+				}
+				state.phase = 'stopped';
+				await this.#save();
+				try {
+					await container.destroy();
+				} catch (error) {
+					state.phase = 'started';
+					await this.#save();
+					throw error;
+				}
+			});
 		} catch (error) {
 			console.error('[flue] Sandbox idle stop failed; retrying.', error);
 			await this.ctx.storage.setAlarm(Date.now() + STOP_RETRY_MS);
@@ -597,13 +751,30 @@ export function createFlueSandboxClass(
 
 const decoder = new TextDecoder();
 
+/** The workspace was replaced underneath its users: bump the generation agents are notified of. */
+function recordChange(state: SandboxState, change: CloudflareWorkspaceChange): void {
+	state.generation++;
+	state.lastChange = change;
+}
+
 function fileError(operation: string, path: string, result: ExecResult): Error {
 	const detail = result.stderr.trim() || `exit code ${result.exitCode}`;
 	return new Error(`${operation} failed for ${path}: ${detail}`);
 }
 
 function newState(definition: string, id: string): SandboxState {
-	return { definition, id, createdAt: new Date().toISOString(), cwds: [] };
+	return {
+		definition,
+		id,
+		createdAt: new Date().toISOString(),
+		cwds: [],
+		phase: 'stopped',
+		generation: 1,
+	};
+}
+
+function isSnapshotMissing(error: unknown): error is Error {
+	return error instanceof Error && /Snapshot ".*" was not found/.test(error.message);
 }
 
 function stoppedWhileStarting(error: unknown): Error {
@@ -617,4 +788,16 @@ function stoppedWhileStarting(error: unknown): Error {
 
 function sleep(ms: number): Promise<undefined> {
 	return new Promise((resolve) => setTimeout(() => resolve(undefined), ms));
+}
+
+function renderNotice(change: CloudflareWorkspaceChange): string {
+	const recheck =
+		'Re-check the workspace before relying on files, installed packages, or command results from earlier in this conversation.';
+	if (change.reason === 'restored') {
+		return (
+			`The sandbox container stopped unexpectedly, and its workspace was restored from a snapshot taken at ${change.snapshotCreatedAt}. ` +
+			`Changes made after that time are gone, and no processes from before are running. ${recheck}`
+		);
+	}
+	return `The sandbox workspace was reset to a fresh copy of its image: earlier files, installed packages, and processes are gone. ${recheck}`;
 }

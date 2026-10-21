@@ -55,9 +55,9 @@ Each sandbox is one container and one workspace, run by one `FlueSandbox` Durabl
 
 Containers have no control plane of their own, so `FlueSandbox` plays that role:
 
-- **Start.** The first call after a stop starts the container from the sandbox's image.
-- **Idle stop.** After `idleTimeoutMs` (10 minutes by default) with no call from any attached agent and no running command, Flue stops the container, which discards its workspace. A running command keeps the container alive, even after the agent that started it has gone.
-- **Unexpected loss.** When a container stops without Flue stopping it (a crash, running out of memory, eviction), the next call starts a fresh container from the image.
+- **Start.** The first call after a stop starts the container, restoring the workspace from its snapshot.
+- **Idle stop.** After `idleTimeoutMs` (10 minutes by default) with no call from any attached agent and no running command, Flue snapshots the root filesystem and stops the container. A running command keeps the container alive, even after the agent that started it has gone.
+- **Unexpected loss.** When a container stops without Flue stopping it (a crash, running out of memory, eviction), the next call restores the last snapshot, or starts a fresh workspace when there is none. The model is told before its next turn, with an `environment` signal saying the workspace was restored to an earlier time or reset.
 - **Cancellation.** Aborting a command kills its whole process group in the container. A `timeoutMs` deadline runs inside the container, so it holds even if a Durable Object restarts.
 
 ## Configure
@@ -113,11 +113,12 @@ export const workspace = cloudflareSandbox({
 	image: 'default', // key in the container entry's images map
 	instance: 'standard-1',
 	enableInternet: true,
+	persist: true,
 	idleTimeoutMs: 10 * 60_000,
 });
 ```
 
-Settings are code: Flue reads them from the definition on every container start, so a deploy that changes them reaches existing sandboxes. New intercepts and the idle timeout apply as soon as the deploy is live, and `image`, `instance`, and `enableInternet` at the next start. Intercepts cannot be removed from a running container, so removing one takes effect at the next start; call `reset()` to apply it now.
+Settings are code: Flue reads them from the definition on every container start, so a deploy that changes them reaches existing sandboxes. New intercepts and the idle timeout apply as soon as the deploy is live, `instance` and `enableInternet` at the next start, `persist` at the next idle stop, and `image` the next time the sandbox boots from its image (see [Persistence](#persistence)). Intercepts cannot be removed from a running container, so removing one takes effect at the next start; call `reset()` to apply it now.
 
 Pass a function to vary settings per sandbox. It receives the sandbox `id`, the Worker `env`, and the Worker's `exports`, and runs on every start:
 
@@ -146,6 +147,17 @@ useSandbox(
 - `id` — the sandbox id; default: the agent instance id.
 - `cwd` — the working directory, created on every start; default: `/workspace`.
 - `env` — environment for this agent's commands, layered over the baseline. Not for secrets: use [intercepts](#secure-egress).
+
+## Persistence
+
+With `persist: true` (the default), the workspace survives idle stops: Flue snapshots the container's root filesystem when it stops it and restores the snapshot at the next start. Installed packages, build caches, and files outside `cwd` all persist.
+
+- A snapshot takes a few seconds and does not pause running commands. Under `vite dev`, snapshots are Docker commits instead: they pause the container while they run, and each one leaves a `workerd-container-snap-*` Docker image behind; remove those with `docker rmi` when you no longer need them.
+- A persisted workspace keeps the image its snapshot was taken from: the snapshot includes the whole root filesystem. Redeploying with a new `Dockerfile` or `image` affects new sandboxes, reset sandboxes, and sandboxes with `persist: false`. To move a workspace to a new image, copy the files you need out, `reset()` it, and copy them back.
+- Snapshots expire after Cloudflare's retention period. A sandbox whose snapshot has expired starts with a fresh workspace and the model is told it was reset.
+- With `persist: false`, each stop discards the workspace, and the next start begins from the image.
+
+Snapshots are not checkpoints of conversation state. Keep knowledge the agent must not lose in [persistent state](/docs/guide/durability/#persisted-state).
 
 ## Shared sandboxes
 
@@ -207,11 +219,12 @@ Flue calls `onStart(container, { id, env, exports })` on every container start, 
 import { workspace } from './cloudflare.ts';
 
 const sandbox = workspace.get(env, sandboxId);
-const { running } = await sandbox.status();
+const { running, generation } = await sandbox.status();
 ```
 
-- `status()` — whether a container is running, the definition name, and when the sandbox was created.
-- `reset()` — discard the container and its workspace; the next call starts fresh.
+- `status()` — running state, workspace generation, last workspace change, and the snapshot the next start restores from.
+- `checkpoint()` — take a snapshot now; the next start restores from it.
+- `reset()` — discard the container and its snapshot; the next call starts fresh.
 - `fetch(port, request)` — send an HTTP request to a server in the container, for example a preview.
 
 ## Upgrading from `@cloudflare/sandbox` 0.x

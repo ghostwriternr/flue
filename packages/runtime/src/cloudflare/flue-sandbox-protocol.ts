@@ -11,7 +11,7 @@ export const FLUE_SANDBOX_CLASS_NAME = 'FlueSandbox';
 /** Durable Object binding `flueWorkerConfig()` adds for `FlueSandbox`. */
 export const FLUE_SANDBOX_BINDING = 'FLUE_SANDBOX';
 
-/** Default idle period before Flue stops a container. */
+/** Default idle period before Flue snapshots and stops a container. */
 export const DEFAULT_IDLE_TIMEOUT_MS = 10 * 60_000;
 
 /** Longest idle period: the platform inactivity timeout (6 hours max) trails it by 5 minutes. */
@@ -36,6 +36,16 @@ export type CloudflareSandboxInstance =
 export type CloudflareSandboxIntercept =
 	{ host: string; https?: boolean; target: Fetcher } | { all: true; target: Fetcher };
 
+/** A root-filesystem snapshot of a sandbox's workspace. */
+export interface CloudflareSandboxSnapshot {
+	/** Platform snapshot id. */
+	readonly id: string;
+	/** Size in bytes of the difference from the image. */
+	readonly size: number;
+	/** When the snapshot was taken (ISO 8601). */
+	readonly createdAt: string;
+}
+
 /** The sandbox a definition's settings are resolved for. */
 export interface CloudflareSandboxContext {
 	/** Sandbox id. */
@@ -49,8 +59,10 @@ export interface CloudflareSandboxContext {
 /**
  * How a sandbox definition's containers run. Flue reads these from code on
  * every start, so a deploy that changes them reaches existing sandboxes:
- * new intercepts and the idle timeout at once, and the image, instance
- * type, and internet access at the next start.
+ * intercepts and the idle timeout at once, the instance type and internet
+ * access at the next start, `persist` at the next idle stop, and the image
+ * the next time the sandbox boots from it (a persisted workspace keeps the
+ * image its snapshot was taken from until `reset()`).
  */
 export interface CloudflareSandboxSettings {
 	/** Key in the container entry's `images` map, or a full image reference. Default: the only configured image, else `cloudflare/debian-trixie`. */
@@ -59,6 +71,8 @@ export interface CloudflareSandboxSettings {
 	instance?: CloudflareSandboxInstance;
 	/** Allow outbound internet access. Default `true`. */
 	enableInternet?: boolean;
+	/** Keep the workspace across idle stops through snapshots. Default `true`; `false` discards it at each stop. */
+	persist?: boolean;
 	/** Idle period before Flue stops the container. Default 10 minutes. */
 	idleTimeoutMs?: number;
 	/** Outbound intercepts applied on every container start. */
@@ -101,6 +115,7 @@ const SETTING_KEYS = new Set([
 	'image',
 	'instance',
 	'enableInternet',
+	'persist',
 	'idleTimeoutMs',
 	'intercepts',
 	'onStart',
@@ -136,15 +151,18 @@ export function validateSettings(settings: unknown, name?: string): CloudflareSa
 		const hint = MISPLACED_KEYS[key];
 		fail(hint ? `"${key}" is not a setting; ${hint}` : `unknown setting "${key}"`);
 	}
-	const { image, instance, enableInternet, idleTimeoutMs, intercepts, onStart } = record;
+	const { image, instance, enableInternet, persist, idleTimeoutMs, intercepts, onStart } = record;
 	if (image !== undefined && (typeof image !== 'string' || image === '')) {
 		fail('image must be a non-empty string');
 	}
 	if (instance !== undefined && !isInstance(instance)) {
 		fail("instance must be 'lite', 'standard-1' to 'standard-4', or { vcpu, memoryMib, diskMb }");
 	}
-	if (enableInternet !== undefined && typeof enableInternet !== 'boolean') {
-		fail('enableInternet must be a boolean');
+	for (const [key, value] of [
+		['enableInternet', enableInternet],
+		['persist', persist],
+	] as const) {
+		if (value !== undefined && typeof value !== 'boolean') fail(`${key} must be a boolean`);
 	}
 	if (
 		idleTimeoutMs !== undefined &&
@@ -190,12 +208,21 @@ function isIntercept(value: unknown): value is CloudflareSandboxIntercept {
 	);
 }
 
+/** Why the workspace was replaced the last time its generation changed. */
+export type CloudflareWorkspaceChange =
+	{ reason: 'restored'; at: string; snapshotCreatedAt: string } | { reason: 'reset'; at: string };
+
 export interface CloudflareSandboxStatus {
 	readonly id: string;
 	/** Export name of the sandbox's definition in `cloudflare.ts`. */
 	readonly definition: string;
 	/** Whether a container is running for this sandbox right now. */
 	readonly running: boolean;
+	/** Increments each time the workspace is restored or reset underneath its users. */
+	readonly generation: number;
+	readonly lastChange?: CloudflareWorkspaceChange;
+	/** The snapshot the next start restores from, if any. */
+	readonly snapshot?: CloudflareSandboxSnapshot;
 	readonly createdAt: string;
 }
 
@@ -220,6 +247,12 @@ export interface RpcRunOptions {
 	/** Environment layered over the baseline (agent env, then per-call env). */
 	env: Record<string, string>;
 	timeoutMs?: number;
+}
+
+/** A workspace notice `FlueSandbox` returns until the observer acknowledges its generation. */
+export interface RpcNotice {
+	readonly generation: number;
+	readonly text: string;
 }
 
 /**
@@ -252,7 +285,11 @@ export interface FlueSandboxRpc {
 	exists(path: string): Promise<boolean>;
 	mkdir(path: string, recursive: boolean): Promise<void>;
 	rm(path: string, recursive: boolean, force: boolean): Promise<void>;
+	/** The pending workspace notice for an observer, if any; acknowledge it after delivery. */
+	notice(scope: string): Promise<RpcNotice | undefined>;
+	acknowledgeNotice(scope: string, generation: number): Promise<void>;
 	status(): Promise<CloudflareSandboxStatus>;
+	checkpoint(): Promise<CloudflareSandboxSnapshot>;
 	reset(): Promise<void>;
 	fetchPort(port: number, request: Request): Promise<Response>;
 }

@@ -161,9 +161,9 @@ The short version, for your reference:
    defaults to the agent instance id, so each agent instance gets its own
    container and workspace. Use `workspace.attach({ id, cwd, env })` to
    share one sandbox between agents, pick another working directory, or
-   set command environment. Flue stops the container after 10 idle
-   minutes by default (`idleTimeoutMs`), which discards its workspace.
-   `instance` defaults to
+   set command environment. The workspace persists across idle stops (Flue
+   snapshots it after 10 idle minutes by default); set `persist: false`
+   for a workspace that is discarded at each stop. `instance` defaults to
    `'standard-1'`; do not suggest `'lite'` for coding agents. With
    several `images`, each definition must name one with `image`. Settings
    are read from code on every container start, so changing them later
