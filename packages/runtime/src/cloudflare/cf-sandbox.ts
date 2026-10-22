@@ -1,301 +1,313 @@
-/** Wraps a @cloudflare/sandbox instance (from getSandbox()) into Sandbox. */
-import { decodeBase64, encodeBase64 } from '../base64.ts';
-import { SandboxDiedError } from '../errors.ts';
-import type { SandboxDriver } from '../sandbox.ts';
-import { sandboxFromDriver } from '../sandbox.ts';
-import type { Sandbox, SandboxFactory } from '../types.ts';
-
 /**
- * Minimal structural surface of a `@cloudflare/sandbox` Durable Object stub
- * (the value returned by `getSandbox()`). Kept structural so `@flue/runtime`
- * does not depend on `@cloudflare/sandbox` and stays importable on Node;
- * only the methods Flue calls are listed. A wrong object fails loudly on
- * the first method call.
+ * The Cloudflare sandbox adapter. `cloudflareSandbox(settings)` defines a
+ * kind of sandbox; the app exports the definition from `cloudflare.ts`, and
+ * agents attach to sandboxes of it by id. Each sandbox is a `FlueSandbox`
+ * Durable Object named `<definition>:<id>`, which owns the container and
+ * its lifecycle; this side only forwards calls over Durable Object RPC, so
+ * it never imports `cloudflare:workers` or `@cloudflare/sandbox`.
  */
-export interface CloudflareSandboxStub {
-	exec(
-		command: string,
-		options?: {
-			cwd?: string;
-			env?: Record<string, string>;
-			timeout?: number;
-		},
-	): Promise<{ success: boolean; stdout: string; stderr: string; exitCode?: number }>;
-	readFile(path: string, options?: { encoding?: string }): Promise<{ content: string }>;
-	writeFile(path: string, content: string, options?: { encoding?: string }): Promise<unknown>;
-	exists(path: string): Promise<{ exists: boolean }>;
-	mkdir(path: string, options?: { recursive?: boolean }): Promise<unknown>;
-	deleteFile(path: string): Promise<unknown>;
-	/**
-	 * Container lifecycle state, read from Durable Object storage without a
-	 * container round trip. The death detector polls it while a call is
-	 * pending; `status` becomes `'stopped'` or `'stopped_with_code'` once the
-	 * container exits.
-	 */
-	getState(): Promise<{ status: string }>;
-}
+import { SandboxDiedError } from '../errors.ts';
+import { normalizePath, type SandboxDriver, sandboxFromDriver } from '../sandbox.ts';
+import type { Sandbox, SandboxFactory } from '../types.ts';
+import {
+	type CloudflareSandboxOptions,
+	type CloudflareSandboxStub,
+	isCloudflareSandboxStub,
+	legacyCloudflareSandbox,
+} from './cf-sandbox-legacy.ts';
+import { getCloudflareContext } from './context.ts';
+import {
+	type BrandedDefinition,
+	type CloudflareSandboxSettingsInput,
+	type CloudflareSandboxStatus,
+	DEFINITION,
+	type DefinitionInternals,
+	FLUE_SANDBOX_BINDING,
+	FLUE_SANDBOX_CLASS_NAME,
+	type FlueSandboxRpc,
+	parseSandboxDied,
+	validateSettings,
+} from './flue-sandbox-protocol.ts';
 
-export interface CloudflareSandboxOptions {
-	/** Working directory inside the container. Defaults to `/workspace`. */
+/** How an agent attaches to a sandbox of a definition. */
+export interface CloudflareSandboxAttachOptions {
+	/** Sandbox id. Agents that use the same id share one sandbox. Default: the agent instance id. */
+	id?: string;
+	/** Working directory, created on every container start. Default `/workspace`. */
 	cwd?: string;
+	/**
+	 * Extra environment for every command from this agent, layered over the
+	 * baseline (`HOME`, `LANG`, `TERM`, `PATH`). Image `ENV` lines don't
+	 * apply to commands; set variables here. Not for secrets: every
+	 * process in the container can read them.
+	 */
+	env?: Record<string, string>;
 }
 
 /**
- * Wrap a Cloudflare Sandbox Durable Object stub into a Flue
- * {@link SandboxFactory}:
+ * A kind of Cloudflare sandbox, from {@link cloudflareSandbox}. Export it
+ * from `cloudflare.ts`: its export name, with the sandbox id, identifies
+ * each sandbox, so renaming the export starts new sandboxes.
+ *
+ * Pass it to `useSandbox()` for a sandbox per agent instance, or attach
+ * with options for a shared id, another working directory, or command
+ * environment.
+ */
+export interface CloudflareSandboxDefinition extends SandboxFactory {
+	/** A sandbox factory with attachment options. */
+	attach(options: CloudflareSandboxAttachOptions): SandboxFactory;
+	/** A sandbox of this definition by id, from anywhere in the Worker (for example an admin route). */
+	get(env: object, id: string): CloudflareSandboxHandle;
+}
+
+/**
+ * Building blocks for managing one Cloudflare sandbox, from
+ * {@link getCloudflareSandbox} or {@link CloudflareSandboxDefinition.get}.
+ */
+export interface CloudflareSandboxHandle {
+	readonly id: string;
+	/** Whether a container is running, and the sandbox's definition and creation time. Throws when the sandbox does not exist. */
+	status(): Promise<CloudflareSandboxStatus>;
+	/**
+	 * Destroy the container: the next use starts a fresh workspace from the
+	 * image. Running commands fail with `SandboxDiedError`
+	 * (`reason: 'reset'`).
+	 */
+	reset(): Promise<void>;
+	/**
+	 * Send an HTTP request to a TCP port in the container (for previews).
+	 * Starts the container if needed; the server must already be listening.
+	 */
+	fetch(port: number, request: Request): Promise<Response>;
+}
+
+/**
+ * Define a kind of sandbox on Cloudflare Containers, run by `FlueSandbox`.
+ * Export it from `cloudflare.ts`, then use it in agents:
  *
  * ```ts
- * import { getSandbox } from '@cloudflare/sandbox';
- * import { env } from 'cloudflare:workers';
- * import { cloudflareSandbox } from '@flue/runtime/cloudflare';
+ * // cloudflare.ts
+ * export const workspace = cloudflareSandbox();
  *
- * export function MyAgent({ id }: AgentProps) {
- *   useSandbox(cloudflareSandbox(getSandbox(env.Sandbox, id)));
+ * // agents/coder.ts
+ * export function Coder() {
+ *   useSandbox(workspace);
  *   return '…';
  * }
  * ```
+ *
+ * Settings may be a function of the sandbox id and the Worker `env`. Flue
+ * reads them from code on every container start, so a deploy that changes
+ * them reaches existing sandboxes.
+ *
+ * Requires a `containers` entry for `FlueSandbox` (with
+ * `scheduling_policy: "durable_object"`) and a migration adding it to
+ * `new_sqlite_classes`; `flueWorkerConfig()` adds the binding.
+ */
+export function cloudflareSandbox(
+	settings?: CloudflareSandboxSettingsInput,
+): CloudflareSandboxDefinition;
+/**
+ * @deprecated Wraps a `@cloudflare/sandbox` 0.x `Sandbox` Durable Object
+ * stub, which Sandbox SDK 1.0 removed. Export a definition from
+ * `cloudflareSandbox(settings)` instead. Removed in Flue 3.0.
  */
 export function cloudflareSandbox(
 	sandbox: CloudflareSandboxStub,
 	options?: CloudflareSandboxOptions,
+): SandboxFactory;
+export function cloudflareSandbox(
+	settingsOrStub: CloudflareSandboxSettingsInput | CloudflareSandboxStub = {},
+	legacyOptions?: CloudflareSandboxOptions,
 ): SandboxFactory {
-	return {
-		createSandbox: async () => cfSandboxToSandbox(sandbox, options?.cwd),
+	if (isCloudflareSandboxStub(settingsOrStub)) {
+		warnLegacyOnce();
+		return legacyCloudflareSandbox(settingsOrStub, legacyOptions);
+	}
+	const settings = settingsOrStub;
+	// Static settings fail where they are written; a settings function is
+	// checked when a sandbox starts.
+	if (typeof settings !== 'function') validateSettings(settings);
+	const internals: DefinitionInternals = { settings };
+	const attach = (options: CloudflareSandboxAttachOptions): SandboxFactory => {
+		const checked = validateAttachOptions(options);
+		return { createSandbox: ({ id }) => attachSandbox(internals, checked, id) };
 	};
-}
-
-/** Single-quote a path for the container shell; embedded quotes become `'\''`. */
-function shellQuote(path: string): string {
-	return `'${path.replace(/'/g, "'\\''")}'`;
-}
-
-/** How often the death detector reads container state while a call is pending. */
-const CONTAINER_STATE_POLL_MS = 5_000;
-/** How long a state probe may go unanswered before the container is presumed dead. */
-const CONTAINER_PROBE_SILENCE_MS = 10_000;
-
-interface DeathDetectorCadence {
-	statePollMs: number;
-	probeSilenceMs: number;
-}
-
-let cadence: DeathDetectorCadence = {
-	statePollMs: CONTAINER_STATE_POLL_MS,
-	probeSilenceMs: CONTAINER_PROBE_SILENCE_MS,
-};
-
-/**
- * Test seam: shrink the death-detector cadence so suites can drive the poller
- * with real timers in milliseconds. Call with no argument to restore the
- * production constants. Deliberately absent from the cloudflare barrel — the
- * cadence is not a public option.
- */
-export function setContainerDeathCadenceForTests(override?: DeathDetectorCadence): void {
-	cadence = override ?? {
-		statePollMs: CONTAINER_STATE_POLL_MS,
-		probeSilenceMs: CONTAINER_PROBE_SILENCE_MS,
+	const definition: CloudflareSandboxDefinition & BrandedDefinition = {
+		[DEFINITION]: internals,
+		createSandbox: ({ id }) => attachSandbox(internals, {}, id),
+		attach,
+		get: (env, id) => createHandle(env, definitionName(internals), id),
 	};
+	return definition;
 }
 
 /**
- * Await a sandbox call while watching for container death. The Cloudflare
- * Sandbox transport leaves in-flight calls pending forever when the container
- * dies, so a bare await can hang an agent indefinitely. While the call is
- * pending, this polls `getState()` (a Durable Object storage read, no
- * container round trip) and rejects with {@link SandboxDiedError} once the
- * container reports stopped; a probe that itself goes unanswered for the
- * silence bound means the Durable Object is unreachable too, and the
- * container is presumed dead with it.
- *
- * There is deliberately no deadline: any status other than `'stopped'` /
- * `'stopped_with_code'` — including transitional ones like `'stopping'` and
- * unrecognized future values — counts as alive, so a legitimately slow
- * command on a healthy container is never interrupted.
- *
- * Liveness only: caller aborts are owned one layer up by
- * `sandboxFromDriver`'s exec abort race, which also consumes this
- * promise's eventual settlement when the caller has already been released.
+ * The sandbox an agent runs on, from its `harness.sandbox`. Throws when the
+ * agent runs on a different sandbox, or when a `useSandbox(..., { cwd })`
+ * override wrapped it (attach with `cwd` instead).
  */
-function raceContainerDeath<T>(
-	sandbox: CloudflareSandboxStub,
-	operation: string,
-	rpc: Promise<T>,
-): Promise<T> {
-	const { statePollMs, probeSilenceMs } = cadence;
-	return new Promise<T>((resolve, reject) => {
-		let settled = false;
-		let pollTimer: ReturnType<typeof setTimeout> | undefined;
-		let silenceTimer: ReturnType<typeof setTimeout> | undefined;
-
-		const settle = (complete: () => void): void => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(pollTimer);
-			clearTimeout(silenceTimer);
-			complete();
-		};
-
-		const probe = (): void => {
-			silenceTimer = setTimeout(() => {
-				settle(() => reject(new SandboxDiedError({ operation, reason: 'probe_silent' })));
-			}, probeSilenceMs);
-			sandbox.getState().then(
-				({ status }) => {
-					if (settled) return;
-					clearTimeout(silenceTimer);
-					if (status === 'stopped' || status === 'stopped_with_code') {
-						settle(() => reject(new SandboxDiedError({ operation, reason: 'stopped' })));
-					} else {
-						pollTimer = setTimeout(probe, statePollMs);
-					}
-				},
-				() => {
-					// A rejecting probe is an answer, not silence — and not proof
-					// of death. Keep polling.
-					if (settled) return;
-					clearTimeout(silenceTimer);
-					pollTimer = setTimeout(probe, statePollMs);
-				},
-			);
-		};
-		pollTimer = setTimeout(probe, statePollMs);
-
-		// These handlers double as the losing branch's rejection consumer, so a
-		// late settlement after death can't surface as an unhandled rejection.
-		rpc.then(
-			(value) => settle(() => resolve(value)),
-			(error: unknown) => settle(() => reject(error)),
+export function getCloudflareSandbox(sandbox: Sandbox): CloudflareSandboxHandle {
+	const handle = (sandbox as { [HANDLE]?: unknown })[HANDLE];
+	if (!handle) {
+		throw new Error(
+			'[flue] getCloudflareSandbox(harness.sandbox) requires a cloudflareSandbox() sandbox. ' +
+				'This agent runs on a different sandbox, or a useSandbox(..., { cwd }) override wrapped it; ' +
+				'attach with `cwd` instead. To look a sandbox up by id, call get(env, id) on its definition.',
 		);
-	});
+	}
+	return handle as CloudflareSandboxHandle;
 }
 
-// Module-private: only cloudflareSandbox() above uses it, and the entry-point
-// tests assert it stays off the cloudflare and internal barrels.
-function cfSandboxToSandbox(sandbox: CloudflareSandboxStub, cwd: string = '/workspace'): Sandbox {
-	// Every container call goes through the death detector so a call that is
-	// in flight when the container dies settles instead of hanging forever.
-	const guarded = <T>(operation: string, rpc: Promise<T>): Promise<T> =>
-		raceContainerDeath(sandbox, operation, rpc);
+// ─── Internals ──────────────────────────────────────────────────────────────
 
-	const api: SandboxDriver = {
-		async readFile(path: string): Promise<string> {
-			const file = await guarded('readFile', sandbox.readFile(path));
-			return file.content;
-		},
+const HANDLE = Symbol.for('@flue/runtime/cloudflare-sandbox');
 
-		async readFileBuffer(path: string): Promise<Uint8Array> {
-			const file = await guarded('readFile', sandbox.readFile(path, { encoding: 'base64' }));
-			return decodeBase64(file.content);
-		},
+const ATTACH_KEYS = new Set(['id', 'cwd', 'env']);
 
-		async writeFile(path: string, content: string | Uint8Array): Promise<void> {
-			if (typeof content === 'string') {
-				await guarded('writeFile', sandbox.writeFile(path, content));
-			} else {
-				await guarded(
-					'writeFile',
-					sandbox.writeFile(path, encodeBase64(content), { encoding: 'base64' }),
-				);
-			}
-		},
+let legacyWarned = false;
 
-		async stat(path: string) {
-			const quoted = shellQuote(path);
-			// `stat -L` follows symlinks so isFile/isDirectory/size/mtime match
-			// fs.stat semantics on the node target; the second (non-following)
-			// stat reports whether the path itself is a symlink.
-			const result = await guarded(
-				'stat',
-				sandbox.exec(`stat -L -c '%s/%Y/%F' ${quoted} && stat -c '%F' ${quoted}`),
-			);
-			if (!result.success) {
-				throw new Error(`stat failed for ${path}: ${result.stderr}`);
-			}
-			const [target = '', self = ''] = (result.stdout ?? '').trim().split('\n');
-			const [size = '0', mtime = '0', type = ''] = target.split('/');
-			return {
-				isFile: type.includes('regular'),
-				isDirectory: type === 'directory',
-				isSymbolicLink: self.trim() === 'symbolic link',
-				size: parseInt(size, 10),
-				mtime: new Date(parseInt(mtime, 10) * 1000),
-			};
-		},
+function warnLegacyOnce(): void {
+	if (legacyWarned) return;
+	legacyWarned = true;
+	console.warn(
+		'[flue] cloudflareSandbox(getSandbox(...)) wraps the @cloudflare/sandbox 0.x Sandbox Durable Object, ' +
+			'which Sandbox SDK 1.0 removed. This path is deprecated and will be removed in Flue 3.0. ' +
+			'Migrate to an exported cloudflareSandbox() definition: run `flue update sandbox cloudflare` ' +
+			'and follow its version 2 upgrade guide.',
+	);
+}
 
-		async readdir(path: string): Promise<string[]> {
-			// Newline-separated `find` includes dotfiles (unlike plain `ls`).
-			const result = await guarded(
-				'readdir',
-				sandbox.exec(`find ${shellQuote(path)} -mindepth 1 -maxdepth 1 -printf '%f\\n'`),
-			);
-			if (!result.success) {
-				throw new Error(`readdir failed for ${path}: ${result.stderr}`);
-			}
-			return result.stdout.split('\n').filter((s: string) => s.length > 0);
-		},
+function validateAttachOptions(
+	options: CloudflareSandboxAttachOptions,
+): CloudflareSandboxAttachOptions {
+	if (typeof options !== 'object' || options === null || Array.isArray(options)) {
+		throw new Error('[flue] attach() expects an options object.');
+	}
+	for (const key of Object.keys(options)) {
+		if (ATTACH_KEYS.has(key)) continue;
+		throw new Error(
+			`[flue] attach() received unknown option "${key}". Attach takes id, cwd, and env; ` +
+				'settings belong in the cloudflareSandbox() definition.',
+		);
+	}
+	if (options.id !== undefined && (typeof options.id !== 'string' || options.id === '')) {
+		throw new Error('[flue] attach() id must be a non-empty string.');
+	}
+	if (options.cwd !== undefined && !options.cwd.startsWith('/')) {
+		throw new Error(`[flue] attach() cwd must be an absolute path, got "${options.cwd}".`);
+	}
+	return options;
+}
 
-		async exists(path: string): Promise<boolean> {
-			const result = await guarded('exists', sandbox.exists(path));
-			return result.exists;
-		},
+/** The definition's export name, recorded when the Worker loaded `cloudflare.ts`. */
+function definitionName(internals: DefinitionInternals): string {
+	if (internals.name !== undefined) return internals.name;
+	throw new Error(
+		'[flue] This cloudflareSandbox() definition is not exported from cloudflare.ts. Export it there: ' +
+			'its export name identifies its sandboxes, so it has to be stable and known to the Worker.',
+	);
+}
 
-		async mkdir(path: string, opts?: { recursive?: boolean }): Promise<void> {
-			await guarded('mkdir', sandbox.mkdir(path, opts));
-		},
+function sandboxStub(env: object, definition: string, id: string): FlueSandboxRpc {
+	const namespace = (env as Record<string, unknown>)[FLUE_SANDBOX_BINDING] as
+		{ getByName(name: string): unknown } | undefined;
+	if (typeof namespace?.getByName !== 'function') {
+		throw new Error(
+			`[flue] cloudflareSandbox() needs the ${FLUE_SANDBOX_CLASS_NAME} Durable Object. Add a "containers" entry ` +
+				`with "class_name": "${FLUE_SANDBOX_CLASS_NAME}" and "scheduling_policy": "durable_object" to your wrangler config, ` +
+				`plus a migration with "new_sqlite_classes": ["${FLUE_SANDBOX_CLASS_NAME}"]. flueWorkerConfig() then adds the ` +
+				`${FLUE_SANDBOX_BINDING} binding.`,
+		);
+	}
+	if (typeof id !== 'string' || id.length === 0) {
+		throw new Error('[flue] A Cloudflare sandbox id must be a non-empty string.');
+	}
+	// Export names never contain ":", so the first one separates the parts.
+	return namespace.getByName(`${definition}:${id}`) as FlueSandboxRpc;
+}
 
-		async rm(path: string, opts?: { recursive?: boolean; force?: boolean }): Promise<void> {
-			if (!opts?.recursive && !opts?.force) {
-				await guarded('rm', sandbox.deleteFile(path));
-				return;
-			}
-			// The provider's delete API handles single files only, so flagged
-			// removals run `rm` in the container. Shell semantics match node's
-			// fs.rm: `-f` resolves on a missing path, `-r` without `-f` fails
-			// on one, and `-f` on a directory still errors. `--` guards paths
-			// beginning with a dash.
-			const result = await guarded(
-				'rm',
-				sandbox.exec(
-					`rm ${opts.force ? '-f ' : ''}${opts.recursive ? '-r ' : ''}-- ${shellQuote(path)}`,
-				),
-			);
-			if (!result.success) {
-				throw new Error(`rm failed for ${path}: ${result.stderr}`);
-			}
-		},
-
-		async exec(
-			command: string,
-			execOpts?: {
-				cwd?: string;
-				env?: Record<string, string>;
-				timeoutMs?: number;
-				signal?: AbortSignal;
-			},
-		): Promise<{ stdout: string; stderr: string; exitCode: number }> {
-			// Cloudflare Sandbox does not currently accept AbortSignal across
-			// the getSandbox(...).exec(...) RPC boundary, so `execOpts.signal`
-			// is deliberately not forwarded — `sandboxFromDriver` (which
-			// this adapter builds on) owns caller-facing abort and rejects
-			// promptly while the container keeps running the command. Only
-			// cloneable execution options cross the RPC boundary.
-			const result = await guarded(
-				'exec',
-				sandbox.exec(command, {
-					cwd: execOpts?.cwd,
-					env: execOpts?.env,
-					// The Cloudflare sandbox `timeout` option is in milliseconds.
-					timeout: execOpts?.timeoutMs,
-				}),
-			);
-
-			return {
-				stdout: result.stdout ?? '',
-				stderr: result.stderr ?? '',
-				exitCode: result.exitCode ?? (result.success ? 0 : 1),
-			};
-		},
+function createHandle(env: object, definition: string, id: string): CloudflareSandboxHandle {
+	const stub = sandboxStub(env, definition, id);
+	return {
+		id,
+		status: () => stub.status(),
+		reset: () => stub.reset(),
+		fetch: (port, request) => call('fetch', stub.fetchPort(port, request)),
 	};
+}
 
-	return sandboxFromDriver(api, cwd);
+/** Await a `FlueSandbox` RPC call, rebuilding `SandboxDiedError` from its RPC-safe tag. */
+async function call<T>(operation: string, reply: Promise<T>): Promise<T> {
+	try {
+		return await reply;
+	} catch (error) {
+		const reason = parseSandboxDied(error);
+		if (reason) throw new SandboxDiedError({ operation, reason });
+		throw error;
+	}
+}
+
+async function attachSandbox(
+	internals: DefinitionInternals,
+	options: CloudflareSandboxAttachOptions,
+	instanceId: string,
+): Promise<Sandbox> {
+	const { id = instanceId, cwd: requestedCwd = '/workspace', env = {} } = options;
+	const workerEnv = getCloudflareContext().env;
+	const name = definitionName(internals);
+	const stub = sandboxStub(workerEnv, name, id);
+	const cwd = normalizePath(requestedCwd);
+	await call('start', stub.ensure(name, id, cwd));
+	const sandbox: Sandbox & { [HANDLE]: CloudflareSandboxHandle } = {
+		...sandboxFromDriver(rpcDriver(stub, cwd, env), cwd),
+		[HANDLE]: createHandle(workerEnv, name, id),
+	};
+	return sandbox;
+}
+
+/** The `FlueSandbox` RPC surface as a {@link SandboxDriver}: paths arrive absolute. */
+function rpcDriver(stub: FlueSandboxRpc, cwd: string, env: Record<string, string>): SandboxDriver {
+	const readFileBuffer = (path: string) => call('readFile', stub.readFile(path));
+	return {
+		async exec(command, options) {
+			// Abort kills the command's process group. sandboxFromDriver
+			// releases the caller at once and consumes this call's settlement.
+			const cmdId = crypto.randomUUID();
+			const signal = options?.signal;
+			const onAbort = (): void => void stub.kill(cmdId).catch(() => {});
+			signal?.addEventListener('abort', onAbort, { once: true });
+			try {
+				return await call(
+					'exec',
+					stub.run(cmdId, command, {
+						cwd: options?.cwd ?? cwd,
+						env: { ...env, ...options?.env },
+						...(options?.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+					}),
+				);
+			} finally {
+				signal?.removeEventListener('abort', onAbort);
+			}
+		},
+		readFileBuffer,
+		readFile: async (path) => new TextDecoder().decode(await readFileBuffer(path)),
+		writeFile: (path, content) =>
+			call(
+				'writeFile',
+				stub.writeFile(
+					path,
+					typeof content === 'string' ? new TextEncoder().encode(content) : content,
+				),
+			),
+		async stat(path) {
+			const { mtimeMs, ...stat } = await call('stat', stub.stat(path));
+			return { ...stat, mtime: new Date(mtimeMs) };
+		},
+		readdir: (path) => call('readdir', stub.readdir(path)),
+		exists: (path) => call('exists', stub.exists(path)),
+		mkdir: (path, options) => call('mkdir', stub.mkdir(path, options?.recursive ?? false)),
+		rm: (path, options) =>
+			call('rm', stub.rm(path, options?.recursive ?? false, options?.force ?? false)),
+	};
 }

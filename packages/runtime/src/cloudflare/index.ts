@@ -21,8 +21,13 @@ export {
 	RETRYABLE_INTERRUPTION_MARKER,
 	WORKERS_AI_OVERFLOW_MARKER,
 } from '../errors.ts';
-export type { CloudflareSandboxOptions, CloudflareSandboxStub } from './cf-sandbox.ts';
-export { cloudflareSandbox } from './cf-sandbox.ts';
+export type {
+	CloudflareSandboxAttachOptions,
+	CloudflareSandboxDefinition,
+	CloudflareSandboxHandle,
+} from './cf-sandbox.ts';
+export { cloudflareSandbox, getCloudflareSandbox } from './cf-sandbox.ts';
+export type { CloudflareSandboxOptions, CloudflareSandboxStub } from './cf-sandbox-legacy.ts';
 export type { CloudflareContext, FlueDurableObjectIdentity } from './context.ts';
 export { getCloudflareContext, getDurableObjectIdentity } from './context.ts';
 export type {
@@ -32,6 +37,13 @@ export type {
 	GeneratedDurableObjectClass,
 } from './extension.ts';
 export { extend } from './extension.ts';
+export type {
+	CloudflareSandboxContext,
+	CloudflareSandboxInstance,
+	CloudflareSandboxSettings,
+	CloudflareSandboxSettingsInput,
+	CloudflareSandboxStatus,
+} from './flue-sandbox-protocol.ts';
 export type { CloudflareGatewayOptions } from './gateway.ts';
 export { type CloudflareTracingOptions, createCloudflareTracing } from './tracing/index.ts';
 // The Workers AI binding provider lives on its own subpath

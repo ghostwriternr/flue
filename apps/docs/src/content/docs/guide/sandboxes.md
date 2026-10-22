@@ -146,7 +146,7 @@ flue add sandbox e2b
 
 The blueprint walks your coding agent through creating `<source-dir>/sandboxes/e2b.ts` and installing the provider SDK. The Ecosystem catalog lists supported providers — including [Daytona](/docs/ecosystem/sandboxes/daytona/), [E2B](/docs/ecosystem/sandboxes/e2b/), [Modal](/docs/ecosystem/sandboxes/modal/), [Cloudflare Sandbox](/docs/ecosystem/sandboxes/cloudflare/), and [Cloudflare Computer](/docs/ecosystem/sandboxes/cloudflare-computer/) — see [Sandboxes in the Ecosystem](/docs/ecosystem/#sandboxes). For an unsupported provider, run `flue add sandbox <docs-url>` and your coding agent can build the adapter against the [Sandbox Adapter API](/docs/reference/sandbox-api/).
 
-Adapters are deliberately thin: your application creates, reuses, and deletes provider sandboxes; Flue only connects to what you hand it and never destroys provider infrastructure. The usual pattern wraps the provider call in the factory itself, so the sandbox is created (or reconnected) lazily at initialization:
+Adapters are deliberately thin, and whoever owns a sandbox's identity owns its lifecycle. With a provider adapter, your application creates, reuses, and deletes provider sandboxes; Flue only connects to what you hand it and never destroys provider infrastructure. The [Cloudflare sandbox](/docs/ecosystem/sandboxes/cloudflare/) is the exception that proves the rule: Containers have no control plane of their own, so Flue owns the lifecycle there (start and idle stop), while your application still picks the sandbox id. The usual pattern wraps the provider call in the factory itself, so the sandbox is created (or reconnected) lazily at initialization:
 
 ```ts title="src/agents/code-runner.ts"
 'use agent';
@@ -169,7 +169,7 @@ export function CodeRunner() {
 
 `createSandbox({ id })` receives the agent instance id. A factory that looks up an existing provider sandbox by that id before creating one gives each conversation a durable workspace that survives across messages and process restarts.
 
-Cancelling a running command — the model's own `timeout`, or your application aborting the surrounding task — always rejects promptly, whatever the provider does under the hood. `local()`'s process-group kill actually stops the command, but most provider SDKs have no mid-flight cancellation: the remote command keeps running in the background after the rejection, and its eventual output is discarded rather than appearing later in the conversation. A provider whose SDK does support cancellation (Vercel, Mirage) stops the command for real instead of just abandoning it.
+Cancelling a running command — the model's own `timeout`, or your application aborting the surrounding task — always rejects promptly, whatever the provider does under the hood. `local()`'s process-group kill actually stops the command, but most provider SDKs have no mid-flight cancellation: the remote command keeps running in the background after the rejection, and its eventual output is discarded rather than appearing later in the conversation. A provider whose SDK does support cancellation (Vercel, Mirage, the Cloudflare sandbox) stops the command for real instead of just abandoning it.
 
 ### Sandbox-provided tools
 
@@ -207,11 +207,11 @@ export function SupportEngineer() {
 }
 ```
 
-Presence of the `useSandbox()` call is read at initialization and again at every turn boundary. When it flips, the environment swaps before the next model call: attaching resolves the declared factory, and detaching removes the environment — the file and shell tools drop with it, and nothing carries over either way. The model is told about the swap with a single `environment` signal in the conversation that restates the complete current state — the new working directory plus the full tool, skill, and subagent rosters — and warns that files and results from the previous environment may no longer be accessible (see [Dynamic resources](/docs/reference/agent-api/#dynamic-resources)).
+Presence of the `useSandbox()` call is read at initialization and again at every turn boundary. When it flips, the environment swaps before the next model call: attaching resolves the declared factory, and detaching removes the environment — the file and shell tools drop with it, and nothing carries over between the two environments. The model is told about the swap with a single `environment` signal in the conversation that restates the complete current state — the new working directory plus the full tool, skill, and subagent rosters — and warns that files and results from the previous environment may no longer be accessible (see [Dynamic resources](/docs/reference/agent-api/#dynamic-resources)).
 
 The system prompt stays frozen: it keeps describing the workspace discovered at initialization until the next [compaction](/docs/reference/agent-hooks-api/#compactionconfig), which re-discovers against the current environment. A swap also rewrites the native tools array, since the file and shell tools come and go with it, and that invalidates the provider's prompt cache.
 
-Only _presence_ is observable: factories are fresh objects on every render, so replacing sandbox A with sandbox B while staying attached doesn't swap mid-run — it takes effect when the next submission initializes. And because the condition lives in persistent state, it replays durably: every later submission re-attaches the same declaration, and an adapter keyed on the instance id resolves back to the same workspace.
+Only _presence_ is observable: factories are fresh objects on every render, so replacing sandbox A with sandbox B while staying attached doesn't swap mid-run — it takes effect when the next submission initializes. And because the condition lives in persistent state, it replays durably: every later submission re-attaches the same declaration, and an adapter keyed on the instance id resolves back to the same workspace. Detaching and re-attaching the same declaration likewise returns the same workspace, with whatever files it held.
 
 ## Next steps
 

@@ -21,6 +21,8 @@
  *   - `main` → `virtual:flue/worker`, the generated Worker entry served by
  *     the `flue()` plugin (left alone when the user set their own `main`);
  *   - one Durable Object binding per scanned `'use agent'` agent;
+ *   - the `FLUE_SANDBOX` binding when a `containers` entry names
+ *     `FlueSandbox`, after validating that entry;
  *   - the `nodejs_compat` compatibility flag (unioned in);
  *   - validation of a user-set `compatibility_date` against Flue's floor.
  *
@@ -39,6 +41,7 @@
  * its own `flue()` instance, concurrent Vite servers in one process never
  * cross-talk.
  */
+import { FLUE_SANDBOX_BINDING, FLUE_SANDBOX_CLASS_NAME } from '@flue/runtime/internal';
 import { stackless } from './diagnostics.ts';
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -73,6 +76,11 @@ export interface FlueWorkerConfigSource {
 	readonly doBindings: readonly FlueDoBinding[];
 	/** Set by the customizer so `configResolved` can diagnose missing wiring. */
 	customizerInvoked: boolean;
+	/**
+	 * Set by the customizer: a `containers` entry names `FlueSandbox`, so the
+	 * generated Worker entry exports it.
+	 */
+	flueSandbox: boolean;
 }
 
 let latestSource: FlueWorkerConfigSource | undefined;
@@ -132,7 +140,10 @@ export function flueWorkerConfig(): FlueWorkerConfigCustomizer {
 				),
 			);
 		}
-		applyFlueWorkerConfig(config as Record<string, unknown>, source.doBindings);
+		source.flueSandbox = applyFlueWorkerConfig(
+			config as Record<string, unknown>,
+			source.doBindings,
+		);
 	};
 }
 
@@ -163,8 +174,9 @@ export function cloudflareOrderingError(): Error {
 function applyFlueWorkerConfig(
 	config: Record<string, unknown>,
 	doBindings: readonly FlueDoBinding[],
-): void {
+): boolean {
 	validateCompatibilityDate(config);
+	const flueSandbox = validateFlueSandboxContainer(config);
 
 	// compatibility_flags: union in nodejs_compat. The deploy artifact is the
 	// sibling-emitted merged config, so the union is always effective; the
@@ -183,12 +195,66 @@ function applyFlueWorkerConfig(
 		config.main = VIRTUAL_WORKER_ENTRY;
 	}
 
-	mergeDurableObjectBindings(config, doBindings);
+	mergeDurableObjectBindings(
+		config,
+		flueSandbox
+			? [...doBindings, { name: FLUE_SANDBOX_BINDING, class_name: FLUE_SANDBOX_CLASS_NAME }]
+			: doBindings,
+	);
 
 	// compatibility_date and name are left to the sibling's own defaults when
 	// unset (its date default tracks the workerd version it bundles, which is
 	// strictly better than a Flue-pinned floor). containers, migrations, and
 	// every other field pass through untouched.
+	return flueSandbox;
+}
+
+/**
+ * Find and validate the `containers` entry for `FlueSandbox`. The entry
+ * and its migration stay user-owned (like agent migration tags); Flue only
+ * checks the fields the Durable Object scheduling policy requires, so a
+ * misconfigured entry fails at build time instead of on the first command.
+ */
+function validateFlueSandboxContainer(config: Record<string, unknown>): boolean {
+	const containers = Array.isArray(config.containers) ? (config.containers as unknown[]) : [];
+	const entries = containers.filter(
+		(entry): entry is Record<string, unknown> =>
+			typeof entry === 'object' &&
+			entry !== null &&
+			(entry as Record<string, unknown>).class_name === FLUE_SANDBOX_CLASS_NAME,
+	);
+	if (entries.length === 0) return false;
+	if (entries.length > 1) {
+		throw stackless(
+			new Error(
+				`[flue] wrangler config has ${entries.length} "containers" entries for "${FLUE_SANDBOX_CLASS_NAME}". ` +
+					'Use one entry; list every image under its "images" map.',
+			),
+		);
+	}
+	const entry = entries[0] as Record<string, unknown>;
+	const problems: string[] = [];
+	if (entry.scheduling_policy !== 'durable_object') {
+		problems.push('set "scheduling_policy": "durable_object"');
+	}
+	for (const field of ['image', 'instance_type', 'max_instances']) {
+		if (entry[field] !== undefined) {
+			problems.push(
+				field === 'image'
+					? 'replace "image" with an "images" map (for example { "default": { "dockerfile": "./Dockerfile" } })'
+					: `remove "${field}" (choose the size per sandbox with cloudflareSandbox({ instance }))`,
+			);
+		}
+	}
+	if (problems.length > 0) {
+		throw stackless(
+			new Error(
+				`[flue] The "${FLUE_SANDBOX_CLASS_NAME}" container entry in your wrangler config needs changes: ` +
+					`${problems.join('; ')}.`,
+			),
+		);
+	}
+	return true;
 }
 
 /**

@@ -1,12 +1,15 @@
 /**
- * The vocabulary of `FlueSandbox`, the Durable Object that owns the
- * container: its RPC surface and the sandbox definitions it runs. Free of
- * `cloudflare:workers` runtime imports, so a caller in another Durable
- * Object can use it.
+ * Shared vocabulary between the Cloudflare sandbox adapter (running in an
+ * agent's Durable Object) and `FlueSandbox`, the Durable Object that owns
+ * the container. Free of `cloudflare:workers` runtime imports, which the
+ * adapter side must not pull in.
  */
 
 /** Class name of the Flue-owned Durable Object that runs Cloudflare sandboxes. */
 export const FLUE_SANDBOX_CLASS_NAME = 'FlueSandbox';
+
+/** Durable Object binding `flueWorkerConfig()` adds for `FlueSandbox`. */
+export const FLUE_SANDBOX_BINDING = 'FLUE_SANDBOX';
 
 /** Default idle period before Flue stops a container. */
 export const DEFAULT_IDLE_TIMEOUT_MS = 10 * 60_000;
@@ -77,6 +80,15 @@ const SETTING_KEYS = new Set(['image', 'instance', 'enableInternet', 'idleTimeou
 
 const INSTANCE_TYPES = new Set(['lite', 'standard-1', 'standard-2', 'standard-3', 'standard-4']);
 
+/** Attachment options people put in settings by mistake, with where they go instead. */
+const MISPLACED_KEYS: Record<string, string> = {
+	id: 'pass it when attaching: definition.attach({ id })',
+	cwd: 'pass it when attaching: definition.attach({ cwd })',
+	env: 'pass it when attaching: definition.attach({ env })',
+	sleepAfter: 'use idleTimeoutMs',
+	keepAlive: 'use a longer idleTimeoutMs',
+};
+
 /**
  * Check a definition's settings, throwing on the first problem. `name` is
  * the definition's export name once known, for error messages.
@@ -92,7 +104,9 @@ export function validateSettings(settings: unknown, name?: string): CloudflareSa
 	}
 	const record = settings as Record<string, unknown>;
 	for (const key of Object.keys(record)) {
-		if (!SETTING_KEYS.has(key)) fail(`unknown setting "${key}"`);
+		if (SETTING_KEYS.has(key)) continue;
+		const hint = MISPLACED_KEYS[key];
+		fail(hint ? `"${key}" is not a setting; ${hint}` : `unknown setting "${key}"`);
 	}
 	const { image, instance, enableInternet, idleTimeoutMs } = record;
 	if (image !== undefined && (typeof image !== 'string' || image === '')) {
@@ -123,6 +137,15 @@ function isInstance(value: unknown): value is CloudflareSandboxInstance {
 	return [vcpu, memoryMib, diskMb].every((n) => typeof n === 'number' && n > 0);
 }
 
+export interface CloudflareSandboxStatus {
+	readonly id: string;
+	/** Export name of the sandbox's definition in `cloudflare.ts`. */
+	readonly definition: string;
+	/** Whether a container is running for this sandbox right now. */
+	readonly running: boolean;
+	readonly createdAt: string;
+}
+
 /** Result of one command. */
 export interface RpcShellResult {
 	stdout: string;
@@ -148,15 +171,23 @@ export interface RpcRunOptions {
 
 /**
  * Errors lose their class across Durable Object RPC, so `FlueSandbox` tags a
- * sandbox death in the message for the caller to recognize.
+ * sandbox death in the message and the adapter rebuilds `SandboxDiedError`.
  */
 const SANDBOX_DIED_TAG = '[flue:sandbox_died:';
 
-export function sandboxDiedMessage(operation: string): string {
-	return `${SANDBOX_DIED_TAG}stopped] Sandbox ${operation} failed: the container stopped while the call was in flight.`;
+export function sandboxDiedMessage(operation: string, reason: 'stopped' | 'reset'): string {
+	return `${SANDBOX_DIED_TAG}${reason}] Sandbox ${operation} failed: the container ${reason === 'reset' ? 'was reset' : 'stopped'} while the call was in flight.`;
 }
 
-/** The `FlueSandbox` RPC surface. */
+export function parseSandboxDied(error: unknown): 'stopped' | 'reset' | undefined {
+	const message = error instanceof Error ? error.message : typeof error === 'string' ? error : '';
+	const start = message.indexOf(SANDBOX_DIED_TAG);
+	if (start === -1) return undefined;
+	const reason = message.slice(start + SANDBOX_DIED_TAG.length).split(']')[0];
+	return reason === 'reset' ? 'reset' : 'stopped';
+}
+
+/** The `FlueSandbox` RPC surface, as the adapter and the public handle call it. */
 export interface FlueSandboxRpc {
 	ensure(definition: string, id: string, cwd: string): Promise<void>;
 	run(cmdId: string, command: string, options: RpcRunOptions): Promise<RpcShellResult>;
@@ -168,4 +199,7 @@ export interface FlueSandboxRpc {
 	exists(path: string): Promise<boolean>;
 	mkdir(path: string, recursive: boolean): Promise<void>;
 	rm(path: string, recursive: boolean, force: boolean): Promise<void>;
+	status(): Promise<CloudflareSandboxStatus>;
+	reset(): Promise<void>;
+	fetchPort(port: number, request: Request): Promise<Response>;
 }
