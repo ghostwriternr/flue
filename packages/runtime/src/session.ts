@@ -241,6 +241,7 @@ import type {
 	ThinkingLevel,
 	ToolDefinition,
 	ToolStep,
+	WorkspaceNotice,
 } from './types.ts';
 import { addUsage, emptyUsage, fromProviderUsage } from './usage.ts';
 
@@ -991,6 +992,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 				: undefined;
 		if (swapped) await this.narrateEnvironmentSnapshot(next.resources.snapshot);
 		else await this.narrateResourceDelta(anchor);
+		await this.narrateWorkspaceNotice();
 		return {
 			context: {
 				// pi 0.87 derives the system prompt from the transcript's leading
@@ -1201,6 +1203,32 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		const { records } = this.drainSignalAppendRecords(parentId);
 		await this.appendCanonical(records);
 		this.mcpUnavailableNarrated = true;
+	}
+
+	/**
+	 * Narrate a sandbox-reported workspace change (restored from an earlier
+	 * snapshot, or replaced with a fresh workspace) as an `environment`
+	 * signal, so the model stops relying on files it saw before the change.
+	 * The sandbox tracks what each conversation has already been told; a
+	 * failing probe is skipped rather than failing the response.
+	 */
+	private async narrateWorkspaceNotice(): Promise<void> {
+		const env = this.attachedEnv;
+		if (!env?.workspaceNotice || !this.activeSubmissionId) return;
+		let notice: WorkspaceNotice | undefined;
+		try {
+			notice = await env.workspaceNotice(this.conversationId);
+		} catch {
+			return;
+		}
+		if (!notice) return;
+		const parentId = await this.conversationWriter.getConversationLeaf(this.conversationId);
+		this.enqueueSignalAppend({ type: 'environment', body: notice.text }, { advance: false });
+		const { records } = this.drainSignalAppendRecords(parentId);
+		await this.appendCanonical(records);
+		// Acknowledge only once the signal is durable: a crash before this
+		// point repeats the notice rather than losing it.
+		await notice.acknowledge().catch(() => {});
 	}
 
 	/** The names-only roster line of one resource kind, as the model sees it. */
@@ -5804,6 +5832,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 					// against the init render — the model's actual turn-1 view.
 					await this.narrateResourceDelta();
 					await this.narrateMcpUnavailable();
+					await this.narrateWorkspaceNotice();
 					await this.runAgentStartHooks(options.signal);
 					// Joins interrupted by a crash resolve by record existence (the
 					// rebuilt context above already carries every applied one), then

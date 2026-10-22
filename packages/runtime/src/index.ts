@@ -188,6 +188,7 @@ export type {
 	ToolOutputSchema,
 	ToolRunEnvelope,
 	ToolStep,
+	WorkspaceNotice,
 } from './types.ts';
 
 // Note: the `Fetchable` interface for user-authored `app.ts` entries lives at
