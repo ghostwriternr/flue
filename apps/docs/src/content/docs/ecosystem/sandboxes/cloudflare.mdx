@@ -62,14 +62,15 @@ Containers have no control plane of their own, so `FlueSandbox` plays that role:
 
 ## Configure
 
-| Requirement                     | Purpose                                                                                                          |
-| ------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| Cloudflare target               | **Required** — Runs the platform-native sandbox integration.                                                     |
-| Workers Paid plan               | **Required** — Containers are a Workers Paid feature.                                                            |
-| Docker (local development only) | **Required for `vite dev`** — Builds and runs the container image locally; not needed for deployed Workers.      |
-| `FlueSandbox` container         | **Required** — The `containers` entry and migration in `wrangler.jsonc`.                                         |
-| Container image                 | **Recommended** — Defines the Linux filesystem and tools; without one, sandboxes use `cloudflare/debian-trixie`. |
-| `@cloudflare/vite-plugin` 1.63+ | **Required** — Supports the `durable_object` scheduling policy. Needs `wrangler` 4.150 or later.                 |
+| Requirement                      | Purpose                                                                                                          |
+| -------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| Cloudflare target                | **Required** — Runs the platform-native sandbox integration.                                                     |
+| Workers Paid plan                | **Required** — Containers are a Workers Paid feature.                                                            |
+| Docker (local development only)  | **Required for `vite dev`** — Builds and runs the container image locally; not needed for deployed Workers.      |
+| `FlueSandbox` container          | **Required** — The `containers` entry and migration in `wrangler.jsonc`.                                         |
+| Container image                  | **Recommended** — Defines the Linux filesystem and tools; without one, sandboxes use `cloudflare/debian-trixie`. |
+| `@cloudflare/vite-plugin` 1.63+  | **Required** — Supports the `durable_object` scheduling policy. Needs `wrangler` 4.150 or later.                 |
+| Environment-variable credentials | **Not required** — Route authenticated APIs through intercepts instead.                                          |
 
 Declare the `FlueSandbox` container entry and append a migration in `wrangler.jsonc`:
 
@@ -116,9 +117,9 @@ export const workspace = cloudflareSandbox({
 });
 ```
 
-Settings are code: Flue reads them from the definition on every container start, so a deploy that changes them reaches existing sandboxes. The idle timeout applies as soon as the deploy is live, and `image`, `instance`, and `enableInternet` at the next start.
+Settings are code: Flue reads them from the definition on every container start, so a deploy that changes them reaches existing sandboxes. New intercepts and the idle timeout apply as soon as the deploy is live, and `image`, `instance`, and `enableInternet` at the next start. Intercepts cannot be removed from a running container, so removing one takes effect at the next start; call `reset()` to apply it now.
 
-Pass a function to vary settings per sandbox. It receives the sandbox `id` and the Worker `env`, and runs on every start:
+Pass a function to vary settings per sandbox. It receives the sandbox `id`, the Worker `env`, and the Worker's `exports`, and runs on every start:
 
 ```ts
 export const workspace = cloudflareSandbox(({ id }) => ({
@@ -144,7 +145,7 @@ useSandbox(
 
 - `id` — the sandbox id; default: the agent instance id.
 - `cwd` — the working directory, created on every start; default: `/workspace`.
-- `env` — environment for this agent's commands, layered over the baseline. Not for secrets: every process in the container can read them.
+- `env` — environment for this agent's commands, layered over the baseline. Not for secrets: use [intercepts](#secure-egress).
 
 ## Shared sandboxes
 
@@ -153,6 +154,50 @@ Agents that attach to the same definition with the same `id` share one sandbox: 
 ```ts
 useSandbox(workspace.attach({ id: `project:${projectId}`, cwd: '/workspace/reviewer' }));
 ```
+
+## Secure egress
+
+Intercepts route outgoing HTTP and HTTPS requests from the container through your Worker, so credentials never enter the container. Export a `WorkerEntrypoint` from `cloudflare.ts`:
+
+```ts title="src/cloudflare.ts"
+import { WorkerEntrypoint } from 'cloudflare:workers';
+
+export class GitHubProxy extends WorkerEntrypoint<Env> {
+	async fetch(request: Request) {
+		const headers = new Headers(request.headers);
+		headers.set('Authorization', `Bearer ${this.env.GITHUB_TOKEN}`);
+		return fetch(request, { headers });
+	}
+}
+```
+
+Then route a host to it from a settings function, which receives the Worker's `exports`:
+
+```ts title="src/cloudflare.ts"
+export const workspace = cloudflareSandbox(({ id, exports }) => {
+	const github = exports.GitHubProxy({ props: { sandboxId: id } });
+	return {
+		intercepts: [{ host: 'api.github.com', https: true, target: github }],
+	};
+});
+```
+
+An intercept's `target` is any `Fetcher`: an exported entrypoint from `exports`, or a service binding from `env`. Use `{ all: true, target }` to route all outbound HTTP. Read secrets from `env` in the entrypoint, and pass what varies per sandbox, such as its id, as `props` (the entrypoint's `ctx.props`). Flue applies intercepts on every container start, and again when a deploy reloads a sandbox whose container is running.
+
+## Container start hook
+
+For setup that intercepts cannot express, such as a background process that should run whenever the container does, use `onStart`:
+
+```ts title="src/cloudflare.ts"
+export const workspace = cloudflareSandbox({
+	async onStart(container) {
+		const daemon = ['sh', '-c', 'my-daemon >/var/log/my-daemon.log 2>&1 &'];
+		await (await container.exec(daemon)).output();
+	},
+});
+```
+
+Flue calls `onStart(container, { id, env, exports })` on every container start, after it prepares the container and applies the intercepts, and before any command runs. Throwing fails the start.
 
 ## Manage a sandbox
 
