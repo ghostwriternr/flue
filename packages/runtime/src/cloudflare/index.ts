@@ -43,7 +43,9 @@ export type {
 	CloudflareSandboxIntercept,
 	CloudflareSandboxSettings,
 	CloudflareSandboxSettingsInput,
+	CloudflareSandboxSnapshot,
 	CloudflareSandboxStatus,
+	CloudflareWorkspaceChange,
 } from './flue-sandbox-protocol.ts';
 export type { CloudflareGatewayOptions } from './gateway.ts';
 export { type CloudflareTracingOptions, createCloudflareTracing } from './tracing/index.ts';

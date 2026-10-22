@@ -332,7 +332,7 @@ The agent can use its built-in tools — grep, glob, read — to search and read
 
 The examples above all run on virtual sandboxes — no container needed. But for agents that need a full Linux environment — git, Node.js, a browser, system packages — you want a remote sandbox.
 
-Cloudflare runs containers natively through [Containers](https://developers.cloudflare.com/containers/). Flue's `cloudflareSandbox()` defines a kind of sandbox whose containers run in `FlueSandbox`, a Durable Object that Flue ships. Each sandbox gets its own container and workspace, with a shell and full Linux userspace. See [Cloudflare Sandbox](/docs/ecosystem/sandboxes/cloudflare/) for the full reference.
+Cloudflare runs containers natively through [Containers](https://developers.cloudflare.com/containers/). Flue's `cloudflareSandbox()` defines a kind of sandbox whose containers run in `FlueSandbox`, a Durable Object that Flue ships. Each sandbox gets its own container and workspace, with a shell and full Linux userspace, and the workspace persists across idle stops. See [Cloudflare Sandbox](/docs/ecosystem/sandboxes/cloudflare/) for the full reference.
 
 If you'd rather connect to an external provider — e.g. Daytona — instead of running the sandbox on Cloudflare, see [Connect a Daytona Sandbox](/docs/ecosystem/sandboxes/daytona/).
 
@@ -431,6 +431,8 @@ Define one sandbox per image, and give each agent the one it needs:
 export const python = cloudflareSandbox({ image: 'python' });
 export const node = cloudflareSandbox({ image: 'node' });
 ```
+
+A persisted workspace keeps the image its snapshot was taken from until it is reset.
 
 ### Secure egress with intercepts
 
