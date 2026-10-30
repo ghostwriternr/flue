@@ -163,6 +163,9 @@ export function getCloudflareSandbox(sandbox: Sandbox): CloudflareSandboxHandle 
 
 const HANDLE = Symbol.for('@flue/runtime/cloudflare-sandbox');
 
+/** How long an aborted command may take to settle after its process group is killed. */
+const KILL_GRACE_MS = 5_000;
+
 const ATTACH_KEYS = new Set(['id', 'cwd', 'env']);
 
 let legacyWarned = false;
@@ -260,7 +263,7 @@ async function attachSandbox(
 	const cwd = normalizePath(requestedCwd);
 	await call('start', stub.ensure(name, id, cwd));
 	const sandbox: Sandbox & { [HANDLE]: CloudflareSandboxHandle } = {
-		...sandboxFromDriver(rpcDriver(stub, cwd, env), cwd),
+		...sandboxFromDriver(rpcDriver(stub, cwd, env), cwd, { cancelGraceMs: KILL_GRACE_MS }),
 		[HANDLE]: createHandle(workerEnv, name, id),
 	};
 	return sandbox;
@@ -271,8 +274,9 @@ function rpcDriver(stub: FlueSandboxRpc, cwd: string, env: Record<string, string
 	const readFileBuffer = (path: string) => call('readFile', stub.readFile(path));
 	return {
 		async exec(command, options) {
-			// Abort kills the command's process group. sandboxFromDriver
-			// releases the caller at once and consumes this call's settlement.
+			// Abort kills the command's process group; sandboxFromDriver waits
+			// (up to KILL_GRACE_MS) for this call to settle before releasing
+			// the caller, so the next call never races a still-running command.
 			const cmdId = crypto.randomUUID();
 			const signal = options?.signal;
 			const onAbort = (): void => void stub.kill(cmdId).catch(() => {});
