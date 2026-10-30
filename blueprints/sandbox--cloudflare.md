@@ -131,7 +131,7 @@ The short version, for your reference:
 
    Image `ENV` lines do not reach agent commands. Pass environment
    variables when attaching (`workspace.attach({ env })`) instead, and
-   never put secrets there.
+   never put secrets there (see step 5).
 
 4. Define the sandbox in `cloudflare.ts` (create the file next to `app.ts`
    if the project has none), and use it in an agent:
@@ -169,7 +169,21 @@ The short version, for your reference:
    are read from code on every container start, so changing them later
    and redeploying reaches existing sandboxes.
 
-5. Tell the user to put local variables in `.dev.vars` or `.env` and run
+5. Credentials stay outside the container. To give commands access to an
+   authenticated API, export a `WorkerEntrypoint` from `cloudflare.ts` that
+   adds the credential, and route the API's hostname to it from a settings
+   function, which receives the Worker's `exports`:
+
+   ```ts
+   export const workspace = cloudflareSandbox(({ id, exports }) => {
+     const api = exports.ExampleApiProxy({ props: { sandboxId: id } });
+     return {
+       intercepts: [{ host: 'api.example.com', https: true, target: api }],
+     };
+   });
+   ```
+
+6. Tell the user to put local variables in `.dev.vars` or `.env` and run
    `vite dev` for local development (Docker must be running; it builds the
    image locally), then `vite build && wrangler deploy --secrets-file .env`
    to deploy. Containers are a Workers Paid feature.
@@ -263,7 +277,8 @@ without first confirming the basics work on the Cloudflare target.
 - **Do not** install `@cloudflare/sandbox` for this integration, or export a
   `Sandbox` class from `cloudflare.ts`. Apps may still install it for its
   own helpers (`DirectoryBackup`, `S3Mount`, `Files`).
-- **Do not** put secrets in `attach({ env })` or the Dockerfile.
+- **Do not** put secrets in `attach({ env })` or the Dockerfile. Use
+  `intercepts`.
 - **Do not** define a `cloudflareSandbox()` inside an agent module or
   leave it unexported: agents can only use definitions that `cloudflare.ts`
   exports.
@@ -349,7 +364,10 @@ the 0.x class, and an agent that uses it:
    Move `ENV` lines into `attach({ env })`.
 
 6. **Network.** A 0.x subclass with `enableInternet = false` becomes
-   `cloudflareSandbox({ enableInternet: false })`.
+   `cloudflareSandbox({ enableInternet: false })`. Outbound handlers become
+   exported `WorkerEntrypoint` classes, routed with `intercepts` whose
+   `target` comes from a settings function's `exports`, and
+   `onStart` hooks become the definition's `onStart`.
 
 7. **Several 0.x sandbox classes** (for example `PyBox` and `NodeBox`)
    become entries in the `FlueSandbox` container entry's `images` map, and
