@@ -2,20 +2,12 @@
 	// User-owned wrangler config for this Flue app. The official Cloudflare
 	// Vite integration reads this file, applies Flue's contributions (via the
 	// flueWorkerConfig() customizer in vite.config.ts), and emits the
-	// deployable Worker output.
-	// src/cloudflare.ts explicitly exports the Sandbox class from @cloudflare/sandbox.
+	// deployable Worker output. flueWorkerConfig() adds the FLUE_SANDBOX
+	// binding for the FlueSandbox container entry below.
 	"$schema": "./node_modules/wrangler/config-schema.json",
 	"name": "assistant",
 	"compatibility_date": "2026-06-01",
 	"compatibility_flags": ["nodejs_compat"],
-	"durable_objects": {
-		"bindings": [
-			{
-				"class_name": "Sandbox",
-				"name": "Sandbox"
-			}
-		]
-	},
 	"migrations": [
 		{
 			"tag": "v1",
@@ -38,12 +30,23 @@
 			// Flue; the generated Worker no longer exports FlueRegistry.
 			"tag": "flue-remove-workflow-registry",
 			"deleted_classes": ["FlueRegistry"]
+		},
+		{
+			// The @cloudflare/sandbox 0.x Sandbox Durable Object is replaced by
+			// FlueSandbox. Deploy this once at 100%.
+			"tag": "flue-sandbox",
+			"deleted_classes": ["Sandbox"],
+			"new_sqlite_classes": ["FlueSandbox"]
 		}
 	],
 	"containers": [
 		{
-			"class_name": "Sandbox",
-			"image": "./Dockerfile"
+			"class_name": "FlueSandbox",
+			"name": "assistant-sandbox",
+			"scheduling_policy": "durable_object",
+			"images": {
+				"default": { "dockerfile": "./Dockerfile" }
+			}
 		}
 	]
 }

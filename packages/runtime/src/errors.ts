@@ -580,28 +580,39 @@ export class InstrumentationAlreadyInstalledError extends FlueError {
 
 /**
  * A sandbox call was in flight when the sandbox died, so the call can never
- * complete. Raised by a sandbox adapter's death detection: when a provider
- * transport leaves in-flight calls pending forever after the sandbox dies,
- * the adapter watches sandbox state while a call is pending and rejects with
- * this error — either because the provider reports the sandbox stopped
- * (`reason: 'stopped'`) or because the state probe itself went unanswered and
- * the sandbox is presumed gone (`reason: 'probe_silent'`).
+ * complete. Raised by a sandbox adapter's death detection with one of these
+ * reasons:
+ *
+ * - `'stopped'`: the provider reports the sandbox stopped (crash, eviction,
+ *   out of memory, or an explicit destroy).
+ * - `'probe_silent'`: the adapter's state probe went unanswered, so the
+ *   sandbox is presumed gone.
+ * - `'reset'`: the sandbox was deliberately reset (for example a
+ *   Cloudflare sandbox's `reset()`), which ended every running call.
  *
  * Deliberately not an `AbortError`: sandbox death is an infrastructure
  * failure, not caller cancellation, and abort classification must not
  * misreport it.
  */
 export class SandboxDiedError extends FlueError {
-	constructor({ operation, reason }: { operation: string; reason: 'stopped' | 'probe_silent' }) {
+	constructor({
+		operation,
+		reason,
+	}: {
+		operation: string;
+		reason: 'stopped' | 'probe_silent' | 'reset';
+	}) {
 		super({
 			type: 'sandbox_died',
 			message:
 				reason === 'stopped'
 					? `Sandbox ${operation} failed: the sandbox stopped while the call was in flight.`
-					: `Sandbox ${operation} failed: the sandbox state probe went unanswered while the call was in flight, so the sandbox is presumed dead.`,
+					: reason === 'reset'
+						? `Sandbox ${operation} failed: the sandbox was reset while the call was in flight.`
+						: `Sandbox ${operation} failed: the sandbox state probe went unanswered while the call was in flight, so the sandbox is presumed dead.`,
 			details: 'The sandbox is no longer running; the interrupted call did not complete.',
 			dev:
-				'The sandbox may have been destroyed, evicted, or crashed (e.g. out of memory). ' +
+				'The sandbox may have been destroyed, reset, evicted, or crashed (e.g. out of memory). ' +
 				'Only calls that were in flight when the sandbox died fail this way; whether a ' +
 				'subsequent call reaches a fresh environment is provider-specific.',
 			meta: { operation, reason },

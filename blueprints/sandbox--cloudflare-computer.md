@@ -410,9 +410,8 @@ Application code uses the file verbs on `harness.sandbox`, or narrows to the
 native surface with `computerWorkspace(harness.sandbox)` for workspace
 operations the generic interface doesn't cover (git, mounts, streams).
 
-If the user needs language toolchains, native binaries, or R2 buckets
-exposed as writable mounted paths, use the `@cloudflare/sandbox` Containers
-adapter instead (`flue add sandbox cloudflare`). `@cloudflare/computer` also
+If the user needs language toolchains or native binaries, use the
+Cloudflare sandbox on Containers instead (`flue add sandbox cloudflare`). `@cloudflare/computer` also
 ships a container backend (`CloudflareContainerBackend`) that syncs the same
 durable filesystem into a Cloudflare Container; treat that as an advanced,
 application-owned configuration via the `workspace` reshape hook, not part

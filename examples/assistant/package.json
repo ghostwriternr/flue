@@ -3,7 +3,6 @@
 	"private": true,
 	"type": "module",
 	"dependencies": {
-		"@cloudflare/sandbox": "*",
 		"@flue/runtime": "workspace:*",
 		"hono": "^4.12.32"
 	},
